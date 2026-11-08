@@ -59,7 +59,7 @@ class PlayerPage extends StatefulWidget {
 class _PlayerPageState extends State<PlayerPage>
     with SingleTickerProviderStateMixin {
   late Player _player;
-  late VideoController _video;
+  late final VideoController _video;
   late int _index;
 
   /// 上下切换动画：新画面从下方/上方滑入，旧画面反方向滑出。
@@ -211,8 +211,11 @@ class _PlayerPageState extends State<PlayerPage>
   bool _cacheEnabled = true;
   final bool _cacheTestHook = Platform.environment['DOUYIN_SEEK_TEST'] == '1';
 
-  /// 预取条数：默认向后 4 条（配合串行预取，够覆盖正常滑动节奏）。
-  int _cacheAhead = 4;
+  /// 预取条数：默认只往后预取 2 条（当前 +1 / +2）。
+  ///
+  /// 需求：只看前方，不回头。在 i5-8250U + 16G 的机器上，多下一条就是
+  /// 多一份带宽、磁盘写入和页面缓存压力，2 条足够覆盖正常滑动节奏。
+  int _cacheAhead = 2;
 
   /// 当前播放的本地文件路径（null = 在线播放，不可 seek）。
   String? _localPath;
@@ -258,6 +261,9 @@ class _PlayerPageState extends State<PlayerPage>
   Duration _duration = Duration.zero;
   Duration? _dragValue;
 
+  /// 上一次真正触发 UI 刷新的播放位置：用于把 position 回调节流到 ~150ms。
+  Duration _lastUiPosition = Duration.zero;
+
   bool _controlsVisible = true;
   bool _forceControls = false;
   Timer? _hideTimer;
@@ -267,6 +273,11 @@ class _PlayerPageState extends State<PlayerPage>
   String _codec = '—';
   String _resolution = '—';
   String _frameRate = '—';
+
+  /// mpv 日志合批：日志先进这里，最多每 500ms 刷新一次 UI。
+  /// 目的是切断"libmpv 内部重试日志 → Flutter 整页重绘"的放大链路。
+  final List<String> _pendingLogs = [];
+  Timer? _logFlushTimer;
 
   AwemeItem get _current => widget.items[_index];
 
@@ -280,6 +291,9 @@ class _PlayerPageState extends State<PlayerPage>
     final settings = AppSettings.instance;
     _cacheMode = settings.cacheMode;
     _hardware = settings.hardwareEnabled;
+    // 音量沿用上次设置：返回主页再进播放页不能又跳回最大音量。
+    _volume = settings.volume;
+    if (_volume <= 0) _muted = true;
     // 自测钩子：DOUYIN_CACHE_MODE=disk|off 临时覆盖缓存策略。
     final envCacheMode = Platform.environment['DOUYIN_CACHE_MODE'];
     if (envCacheMode != null && envCacheMode.isNotEmpty) {
@@ -311,13 +325,13 @@ class _PlayerPageState extends State<PlayerPage>
 
     _initPlayer();
 
-    // 磁盘预缓存：默认向后预取 4 条、上限取设置值（默认 2GB）、不限速。
+    // 磁盘预缓存：只往后预取 2 条（当前 +1/+2），不回头缓存已看过的。
     // 全部可用环境变量覆盖，离屏自测时用来把缓存目录指到临时目录。
     _cacheEnabled =
         _cacheMode == CacheMode.disk && Platform.environment['DOUYIN_CACHE'] != '0';
     final ahead =
-        int.tryParse(Platform.environment['DOUYIN_CACHE_ITEMS'] ?? '') ?? 4;
-    _cacheAhead = ahead.clamp(2, 8);
+        int.tryParse(Platform.environment['DOUYIN_CACHE_ITEMS'] ?? '') ?? 2;
+    _cacheAhead = ahead.clamp(1, 4);
     final envMaxMB =
         int.tryParse(Platform.environment['DOUYIN_CACHE_MAX_MB'] ?? '');
     final limitBytes =
@@ -332,11 +346,15 @@ class _PlayerPageState extends State<PlayerPage>
     }
     unawaited(_loadQualityPref());
 
-    // 常开轮询：即使调试面板没打开，也把硬解/渲染信息写进 diag 日志，
-    // 便于离屏自测时判定是否真的走了 GPU 解码。
-    _propertyTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _readProperties();
-    });
+    // 常开轮询变成按需轮询：只有调试面板打开时才定时读 mpv 属性，
+    // 避免"调试面板关着也每秒一次 setState + mpv 属性请求"。
+    // 每秒读 15+ 个 mpv 属性 + setState 整页重绘，在 Intel UHD 620 上
+    // 也是 GPU 占用的来源之一。
+    if (_showDebug) {
+      _propertyTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        _readProperties();
+      });
+    }
 
     _installTestHooks();
     _resetHideTimer();
@@ -351,16 +369,25 @@ class _PlayerPageState extends State<PlayerPage>
     _player = Player();
     _video = VideoController(
       _player,
-      // 固定输出纹理为 1280x720：不同分辨率的视频不再反复重建视频输出，
-      // 单块纹理由 1080P 的 ~8MB 降到 ~3.5MB；窗口播放区约 1025x576，
-      // 视觉上无损，但内存台阶明显变低。
+      // 关键：**不要**传 width/height。
+      //
+      // media_kit 的语义是：width/height 一旦给了，原生纹理就固定按这个
+      // 尺寸出帧（VideoOutput.videoSize 直接返回 width/height，不再看视频
+      // 自己的 dw/dh）。之前固定 1280x720 带来两个连锁问题：
+      //   1. 竖屏视频（9:16）被塞进 16:9 的纹理，libmpv 只能在纹理内部
+      //      左右补黑 → 黑边被"烤"进纹理，Flutter 侧再怎么 contain 都去不掉，
+      //      表现就是"视频两边有黑块"；
+      //   2. 窗口尺寸变化时纹理和窗口纵横比进一步错位，只能靠重建播放器
+      //      去纠正 → 重建期间黑屏/卡住 = "全屏和调窗口后卡顿"。
+      //
+      // 不传时原生按视频本身的 dw/dh 出纹理，Flutter 侧 `Video` 的
+      // FittedBox(BoxFit.contain) 负责缩放到窗口，天然自适应、无黑块，
+      // 且**窗口怎么缩放都不需要重建播放器**。
       // enableHardwareAcceleration 是渲染层（纹理/GPU 拷贝）的开关，
       // 与 mpv 的 hwdec 不是一回事：某些机器解码能软解、但纹理硬件加速失败，
       // 表现为黑屏+报错，二级降级就靠关掉它来恢复画面。
       configuration: VideoControllerConfiguration(
         enableHardwareAcceleration: _renderHwAccel,
-        width: 1280,
-        height: 720,
       ),
     );
     _mpvConfigured = false;
@@ -370,9 +397,24 @@ class _PlayerPageState extends State<PlayerPage>
     _subscriptions.add(_player.stream.log.listen((event) {
       diag('mpv', '${event.level}: ${event.text}');
       if (!mounted) return;
-      setState(() {
-        _logs.add('[${event.level}] ${event.text}');
-        if (_logs.length > 24) _logs.removeRange(0, _logs.length - 24);
+      // 关键性能点：**不要每条 mpv 日志都 setState**。
+      //
+      // 原实现是收到日志就 setState 刷新 _logs，等于让 libmpv 的内部重试
+      // （osc / file cache 这类每秒几十次的失败日志）驱动 Flutter 整页重绘。
+      // 在 Intel UHD 620 上这是 GPU 占用的主要来源之一。
+      // 现在：日志照旧进 diag 落盘，但只有在调试面板真的打开时才更新 UI，
+      // 并且合并到最多每 500ms 一次。
+      if (!_showDebug) return;
+      _pendingLogs.add('[${event.level}] ${event.text}');
+      _logFlushTimer ??= Timer(const Duration(milliseconds: 500), () {
+        _logFlushTimer = null;
+        if (!mounted || _pendingLogs.isEmpty) return;
+        final batch = List<String>.from(_pendingLogs);
+        _pendingLogs.clear();
+        setState(() {
+          _logs.addAll(batch);
+          if (_logs.length > 24) _logs.removeRange(0, _logs.length - 24);
+        });
       });
     }));
     _subscriptions.add(_player.stream.error.listen((event) {
@@ -401,17 +443,30 @@ class _PlayerPageState extends State<PlayerPage>
         return;
       }
       if (!mounted) return;
+      // 同样不要每条错误都整页重绘：错误文案只在不重复时才 setState。
+      final message = ErrorText.play(event);
+      final line = '[error] $event';
+      if (_playError == message && _logs.isNotEmpty && _logs.last == line) return;
       setState(() {
         // 界面上只显示中文：mpv / libavformat 给的是英文原文，
         // 统一翻成可读的原因；原文仍然进 _logs 与 diag 供排障。
-        _playError = ErrorText.play(event);
-        _logs.add('[error] $event');
+        _playError = message;
+        _logs.add(line);
         if (_logs.length > 24) _logs.removeRange(0, _logs.length - 24);
       });
     }));
     _subscriptions.add(_player.stream.position.listen((p) {
       if (!mounted) return;
-      setState(() => _position = p);
+      // 性能要点（i5-8250U / UHD 620）：position 回调频率跟着 mpv 的属性
+      // 刷新走，一秒可能十几次。每次都 setState 等于整棵播放页重建十几次，
+      // 而这些重建里唯一要变的只是控制条上的时间文字与进度条。
+      // 这里把 UI 刷新节流到 ~150ms（肉眼仍然连续），但 _position 本身
+      // 始终更新为最新值，seek / 缓存补跳等逻辑读到的都是准确位置。
+      _position = p;
+      final delta = (p - _lastUiPosition).inMilliseconds.abs();
+      if (delta < 150) return;
+      _lastUiPosition = p;
+      setState(() {});
     }));
     _subscriptions.add(_player.stream.duration.listen((d) {
       if (!mounted) return;
@@ -447,7 +502,21 @@ class _PlayerPageState extends State<PlayerPage>
     }));
   }
 
-  /// 重建播放器（用于验证/缓解长时间切换导致的内存不回收）。
+  /// 窗口尺寸变化**不再重建视频输出**。
+  ///
+  /// 历史包袱：早期为了"纹理跟着窗口尺寸走"，在这里监听 LayoutBuilder 的
+  /// constraints，去抖后 `_recyclePlayer()` + 重新 open 媒体。实测在
+  /// i5-8250U / UHD 620 上这套逻辑是纯负担：
+  ///   * 每次重建都要销毁 Player → 释放纹理/EGL → 新建 → 重新解封装，
+  ///     这几百毫秒里画面是黑的，用户感知就是"全屏/调窗口后卡顿"；
+  ///   * 而且重建换来的纹理尺寸仍然和窗口纵横比不一致，黑边照旧。
+  ///
+  /// 真正的解法是让纹理保持视频原始尺寸，由 `Video` 组件的
+  /// FittedBox(BoxFit.contain) 做展示层缩放——GPU 采样一次即可，
+  /// 窗口拖多大都不需要碰播放器。所以这套 resize 机制整体移除。
+  ///
+  /// 保留 [_recyclePlayer] 本身：内存回收自测钩子（DOUYIN_RECYCLE_EVERY）
+  /// 与硬解失败降级还会用到它。
   Future<void> _recyclePlayer() async {
     final old = _player;
     _subscriptions.forEach((s) => s.cancel());
@@ -729,6 +798,43 @@ class _PlayerPageState extends State<PlayerPage>
       await platform.setProperty('keep-open', 'no');
       await platform.setProperty('user-agent', PlatformAdapter.userAgent);
       await platform.setProperty('referrer', 'https://www.douyin.com/');
+
+      // ---- 压制 mpv 内部噪音（Intel 核显 / 沙盒环境尤甚）----
+      //
+      // 现场表现：调试面板里反复刷
+      //   [error] error: property not found _setProperty(osc, 1)
+      //   [error] Failed to create file cache.
+      // 前者是 libmpv 内部想把 on-screen controller 打开（我们根本不用它的
+      // OSC，控制条全是 Flutter 自己画的），每帧都试着设一次、每帧都失败；
+      // 后者是 media_kit 默认下发 `cache-on-disk=yes`，而 macOS 沙盒里
+      // 那个缓存路径不可写，于是不停重试不停报错。
+      // 两者都会走 stream.log → setState，等于**每秒多次触发整页重绘**，
+      // 在 UHD 620 这种核显上就是实打实的 GPU 占用。
+      try {
+        await platform.setProperty('osc', 'no');
+        await platform.setProperty('osd-level', '0');
+        await platform.setProperty('osd-bar', 'no');
+      } catch (e) {
+        diag('mpv', '关闭 osc/osd 失败: $e');
+      }
+      // macOS 沙盒内 disk cache 必然失败：直接关掉，别再让它反复重试。
+      if (Platform.isMacOS) {
+        try {
+          await platform.setProperty('cache-on-disk', 'no');
+        } catch (e) {
+          diag('mpv', '关闭 cache-on-disk 失败: $e');
+        }
+      }
+      // 把 mpv 日志级别压到 fatal：debug/warn 级别的重试噪音不再进入
+      // stream.log，从源头掐掉"每条日志一次 setState"的重绘风暴。
+      // 真需要排障时用环境变量放开（DOUYIN_MPV_VERBOSE=1）。
+      if (Platform.environment['DOUYIN_MPV_VERBOSE'] != '1') {
+        try {
+          await platform.setProperty('msg-level', 'all=fatal');
+        } catch (e) {
+          diag('mpv', '设置 msg-level 失败: $e');
+        }
+      }
       // 缓冲必须保留：抖音是 fragmented mp4，解析 moov/索引时 ffmpeg 会尝试
       // seek，cache=no / readahead=0 会让部分视频直接 "Failed to open"。
       // 这里取中间值：16MB / 8MB / 3 秒，既比默认小一半，也不破坏可播性。
@@ -1222,6 +1328,12 @@ class _PlayerPageState extends State<PlayerPage>
       } else if (_volume > 0 && _pendingUnmuteVolume == 0) {
         _pendingUnmuteVolume = _volume;
         await _player.setVolume(0);
+      } else if (_volume <= 0) {
+        // 用户上次把音量拖到 0（或静音后重启）：必须显式置 0。
+        // 否则新 Player 的默认音量是 100，一开播就"最大声"，
+        // 正好是"返回主页再进来音量变最大"的另一条路径。
+        _pendingUnmuteVolume = 0;
+        await _player.setVolume(0);
       }
       // 不再先 stop()：mpv 的 loadfile 替换媒体时会释放旧解码器，但复用同一个
       // vo/render context 与输出纹理；先 stop() 会把 vo 一并拆掉，导致每条视频
@@ -1336,22 +1448,23 @@ class _PlayerPageState extends State<PlayerPage>
 
   // ------------------------------------------------------- 磁盘预缓存调度
 
-  /// 排预取。
+  /// 排预取：**只看前方，不回头**。
   ///
-  /// 顺序：`index+1` 第一条开工（用户最可能马上切过去，下完就能"秒开 + 可拖"），
-  /// 然后按距离往后排，当前条放最后（它已在线在播，只为拖动服务）。
-  /// 保留窗口放宽到 `index-2 .. index+ahead`：用户只是来回翻几条时，
-  /// 刚下到一半的任务不会被取消重下——否则永远差一点点下完，命中率起不来。
+  /// 顺序：`index+1` 第一条开工（用户最可能马上切过去），接着 `index+2`，
+  /// 当前条排最后（它已在线在播，本地副本只服务于"拖动进度"）。
+  /// 窗口外的任务一律取消——包括已经划过的旧条，这就是"不要把上一个视频
+  /// 也缓存下来"的落实点。
   void _scheduleCacheAhead(int gen) {
     if (!mounted || !_cacheEnabled) return;
     final keep = <String>{};
 
-    void enqueue(int i, {required bool isCurrent}) {
+    void enqueue(int i) {
       final it = widget.items[i];
       final v = _pickVariant(it.variants, _qualityPref);
       final height = v?.height ?? 720;
       final url = v?.url ?? it.playUrl;
       if (url.isEmpty) return;
+      final isCurrent = i == _index;
       keep.add(VideoCache.keyOf(it.id, height));
       unawaited(_cache.ensure(it.id, height, url).then((f) {
         if (!mounted || f == null) return;
@@ -1368,27 +1481,20 @@ class _PlayerPageState extends State<PlayerPage>
       }));
     }
 
-    final next = _index + 1;
-    if (next < widget.items.length) enqueue(next, isCurrent: false);
-    for (var offset = 2; offset <= _cacheAhead; offset++) {
+    // 只往前：当前 +1 到 +_cacheAhead（默认 2 条），不回头。
+    for (var offset = 1; offset <= _cacheAhead; offset++) {
       final i = _index + offset;
       if (i >= widget.items.length) break;
-      enqueue(i, isCurrent: false);
+      enqueue(i);
     }
     // 当前条排最后：它已经在线在播，本地副本只服务于"拖动进度"。
     // 排前面会占掉一整个时间片，把"下一条"挤晚——那才是命中率的关键。
     // 用户真拖进度时走 urgent，会取消其他任务独占带宽。
-    enqueue(_index, isCurrent: true);
+    enqueue(_index);
 
-    // 刚划走的几条：往往已下到一半，别取消。
-    for (var offset = 1; offset <= 2; offset++) {
-      final i = _index - offset;
-      if (i < 0) break;
-      final it = widget.items[i];
-      final v = _pickVariant(it.variants, _qualityPref);
-      keep.add(VideoCache.keyOf(it.id, v?.height ?? 720));
-    }
-
+    // 窗口外的任务全部取消：包括刚才划过的旧条（上一个 / 上上个）。
+    // 这是"不缓存已看过的视频"的关键——旧版会刻意保留 index-1 / index-2，
+    // 导致缓存里长期积着不会再看的条目。
     _cache.cancelExcept(keep);
     if (_cacheTestHook) {
       unawaited(_cache.statsLine().then((s) => diag('cache-stats', s)));
@@ -2065,6 +2171,9 @@ class _PlayerPageState extends State<PlayerPage>
     final next = !_fullscreen;
     setState(() => _fullscreen = next);
     await wm.windowManager.setFullScreen(next);
+    // 不需要（也不应该）在这里等窗口动画结束再去"重建视频输出"：
+    // 视频纹理保持视频原始尺寸，展示层由 FittedBox(BoxFit.contain) 缩放，
+    // 窗口一变，下一帧布局就自动贴合。等待 + 重建只会引入黑屏空窗期。
   }
 
   void _toast(String message) {
@@ -2344,6 +2453,8 @@ class _PlayerPageState extends State<PlayerPage>
       _volume = clamped;
       _muted = clamped == 0;
     });
+    // 音量是用户明确设置的偏好：立刻落盘，返回主页再进来要沿用。
+    unawaited(AppSettings.instance.setVolume(clamped));
     if (_pendingUnmuteVolume > 0) {
       // 首帧还没上屏，只更新目标音量，等上屏后一起恢复。
       _pendingUnmuteVolume = clamped;
@@ -2372,12 +2483,27 @@ class _PlayerPageState extends State<PlayerPage>
     _resetHideTimer();
   }
 
+  /// 切换调试面板，同时同步 mpv 属性轮询的开/关。
+  ///
+  /// 轮询本身是"每秒读 15+ 个 mpv 属性 + setState 整页重绘"，
+  /// 面板关着时完全没有必要跑——这是核显机器上白付的 GPU/CPU 开销。
+  void _toggleDebug() {
+    final next = !_showDebug;
+    setState(() => _showDebug = next);
+    _propertyTimer?.cancel();
+    _propertyTimer = null;
+    if (next) {
+      _propertyTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        _readProperties();
+      });
+    }
+  }
+
   void _handleEsc() {
     if (_showDebug) {
-      setState(() => _showDebug = false);
+      _toggleDebug();
       return;
-    }
-    if (_showComments) {
+    }    if (_showComments) {
       setState(() => _showComments = false);
       return;
     }
@@ -2395,6 +2521,7 @@ class _PlayerPageState extends State<PlayerPage>
     _firstFrameTimer?.cancel();
     _loadDeadlineTimer?.cancel();
     _bufferTimer?.cancel();
+    _logFlushTimer?.cancel();
     _slideCtrl.dispose();
     _bounceCtrl.dispose();
     _outgoingFrame?.dispose();
@@ -2528,59 +2655,78 @@ class _PlayerPageState extends State<PlayerPage>
                         AnimatedBuilder(
                           animation: _animListenable,
                           builder: (context, _) {
-                            final t = Curves.easeOutCubic
-                                .transform(_slideCtrl.value.clamp(0.0, 1.0));
+                            final raw = _slideCtrl.value.clamp(0.0, 1.0);
+                            final t = Curves.easeOutCubic.transform(raw);
                             // 越界回弹：sin 单峰，0→1→0，画面轻推一下就弹回。
                             final bounce =
                                 math.sin(_bounceCtrl.value * math.pi);
+
+                            // 视频层本体：结构**恒定**，切换动画结束后不会被
+                            // 重挂载（重挂载 = Texture 重建 = 闪一下）。
+                            final videoLayer = Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                // 首帧前：封面模糊占位，避免纯黑干等。
+                                // 不显示就不构建，省掉高斯模糊的 ImageFilterLayer。
+                                if (_opening) _CoverBlur(url: item.coverUrl),
+                                AnimatedOpacity(
+                                  opacity: _opening ? 0.0 : 1.0,
+                                  duration:
+                                      const Duration(milliseconds: 220),
+                                  child: RepaintBoundary(
+                                    key: _videoBoundaryKey,
+                                    child: Video(
+                                      key: ValueKey(_video),
+                                      controller: _video,
+                                      fit: BoxFit.contain,
+                                      fill: Colors.black,
+                                      controls: (state) =>
+                                          const SizedBox.shrink(),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            );
+
+                            final settled =
+                                raw >= 1.0 && _bounceCtrl.value == 0;
+
                             return LayoutBuilder(
                               builder: (context, constraints) {
                                 final h = constraints.maxHeight;
+                                final dy = settled
+                                    ? 0.0
+                                    : _slideDir * h * 0.16 * (1 - t) -
+                                        _bounceDir * 12.0 * bounce;
                                 return Stack(
                                   fit: StackFit.expand,
                                   children: [
-                                    // 新内容层：位移 + 淡入 + 轻微缩放。
-                                    // 越界回弹时（delta 已被拒绝），额外朝越界方向
-                                    // 轻推 12px 再弹回，给出"到头了"的物理反馈。
-                                    Transform.translate(
-                                      offset: Offset(
-                                        0,
-                                        _slideDir * h * 0.16 * (1 - t) -
-                                            _bounceDir * 12.0 * bounce),
-                                      child: Transform.scale(
-                                        scale: 0.985 + 0.015 * t,
-                                        child: Opacity(
-                                          opacity: 0.45 + 0.55 * t,
-                                          child: Stack(
-                                            fit: StackFit.expand,
-                                            children: [
-                                              // 首帧前：封面模糊占位，避免纯黑干等。
-                                              AnimatedOpacity(
-                                                opacity: _opening ? 1.0 : 0.0,
-                                                duration: const Duration(
-                                                    milliseconds: 240),
-                                                child: _CoverBlur(
-                                                    url: item.coverUrl),
-                                              ),
-                                              AnimatedOpacity(
-                                                opacity: _opening ? 0.0 : 1.0,
-                                                duration: const Duration(
-                                                    milliseconds: 300),
-                                                child: RepaintBoundary(
-                                                  key: _videoBoundaryKey,
-                                                  child: Video(
-                                                    key: ValueKey(_video),
-                                                    controller: _video,
-                                                    fit: BoxFit.contain,
-                                                    fill: Colors.black,
-                                                    controls: (state) =>
-                                                        const SizedBox.shrink(),
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
+                                    // 新内容层：位移 + 淡入。
+                                    //
+                                    // 这里刻意**不用** Transform.translate /
+                                    // Transform.scale：它们会给视频纹理套一层
+                                    // TransformLayer，合成器每帧都要多做一次
+                                    // 变换 + 可能的离屏重采样，在 Intel UHD 620
+                                    // 上就是"播放时轻微闪动 + GPU 占用高"。
+                                    //
+                                    // FractionalTranslation 只偏移绘制位置，
+                                    // 不创建任何合成层；Opacity 在 1.0 时走
+                                    // RenderOpacity 的零层快路径（alpha==255
+                                    // 直接 paintChild）。所以静止期这两层
+                                    // 完全等价于"没有包装"。
+                                    //
+                                    // 轻微缩放（原 0.985→1.0）为性能让路去掉：
+                                    // 1.5% 的缩放肉眼几乎无感，但代价是每帧
+                                    // 一次 scale 合成。
+                                    FractionalTranslation(
+                                      translation: Offset(
+                                          0, h <= 0 ? 0 : dy / h),
+                                      child: Opacity(
+                                        opacity: settled
+                                            ? 1.0
+                                            : (0.45 + 0.55 * t)
+                                                .clamp(0.0, 1.0),
+                                        child: videoLayer,
                                       ),
                                     ),
                                     // 旧画面滑出层：与进入方向相反，同时淡出。
@@ -2607,10 +2753,14 @@ class _PlayerPageState extends State<PlayerPage>
                           },
                         ),
                         // 加载层：半透明暗化 + 进度圈 + 文案（封面占位在其下方）。
-                        IgnorePointer(
-                          child: AnimatedOpacity(
-                            opacity: _opening ? 1.0 : 0.0,
-                            duration: const Duration(milliseconds: 220),
+                        //
+                        // 只在 _opening 为真时构建。原来的写法用 AnimatedOpacity
+                        // 把它"藏"起来，但子树始终在渲染树里：即使肉眼看不见，
+                        // 每帧照样要布局 + 绘制一层全屏半透明色块，在核显上
+                        // 是白付的填充带宽。播放稳定期 _opening 恒为 false，
+                        // 所以这里直接不构建最划算。
+                        if (_opening)
+                          IgnorePointer(
                             child: Container(
                               color: const Color(0x59000000),
                               alignment: Alignment.center,
@@ -2633,7 +2783,6 @@ class _PlayerPageState extends State<PlayerPage>
                               ),
                             ),
                           ),
-                        ),
                         if (_playError != null)
                           _PlayErrorOverlay(
                             message: _playError!,
@@ -2766,8 +2915,7 @@ class _PlayerPageState extends State<PlayerPage>
                                     }),
                                 onQuality: _showQualityPicker,
                                 onPip: () => _toast('桌面端暂不支持画中画'),
-                                onSettings: () => setState(
-                                    () => _showDebug = !_showDebug),
+                                onSettings: () => _toggleDebug(),
                               ),
                             ),
                           ),

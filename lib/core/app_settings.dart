@@ -37,6 +37,7 @@ class AppSettings extends ChangeNotifier {
   static const String keyCacheMode = 'douyin_cache_mode';
   static const String keyCacheLimitMB = 'douyin_cache_limit_mb';
   static const String keyQualityPref = 'douyin_quality_pref';
+  static const String keyVolume = 'douyin_volume';
 
   /// 磁盘缓存上限可选项（MB）。
   static const List<int> cacheLimitOptions = [512, 1024, 2048, 4096, 8192];
@@ -49,11 +50,16 @@ class AppSettings extends ChangeNotifier {
   int _cacheLimitMB = defaultCacheLimitMB;
   String _qualityPref = 'auto';
 
+  /// 播放音量（0~100）。持久化：返回主页再进播放页要沿用上次的音量，
+  /// 不能每次都回到最大音量。旧用户没有这个键时默认 100。
+  double _volume = 100;
+
   DecodeMode get decodeMode => _decodeMode;
   CacheMode get cacheMode => _cacheMode;
   int get cacheLimitMB => _cacheLimitMB;
   int get cacheLimitBytes => _cacheLimitMB * 1024 * 1024;
   String get qualityPref => _qualityPref;
+  double get volume => _volume;
 
   /// 是否请求硬件解码。`auto` 模式即"硬解优先"。
   bool get hardwareEnabled => _decodeMode == DecodeMode.auto;
@@ -67,6 +73,8 @@ class AppSettings extends ChangeNotifier {
       final mb = prefs.getInt(keyCacheLimitMB);
       if (mb != null && mb > 0) _cacheLimitMB = mb;
       _qualityPref = prefs.getString(keyQualityPref) ?? 'auto';
+      final vol = prefs.getDouble(keyVolume);
+      if (vol != null) _volume = vol.clamp(0.0, 100.0);
     } catch (e) {
       debugPrint('[settings] 读取设置失败，使用默认值: $e');
     }
@@ -120,6 +128,20 @@ class AppSettings extends ChangeNotifier {
       await prefs.setString(keyQualityPref, value);
     } catch (e) {
       debugPrint('[settings] 保存清晰度偏好失败: $e');
+    }
+  }
+
+  /// 保存播放音量（0~100）。音量是用户明确设置的偏好，必须跨页面保留。
+  Future<void> setVolume(double value) async {
+    final v = value.clamp(0.0, 100.0).toDouble();
+    if (_volume == v) return;
+    _volume = v;
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(keyVolume, v);
+    } catch (e) {
+      debugPrint('[settings] 保存音量失败: $e');
     }
   }
 
