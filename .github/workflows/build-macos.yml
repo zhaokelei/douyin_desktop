@@ -1,0 +1,65 @@
+# 云端构建 macOS 版。
+#
+# 用法一（手动）：推到 GitHub 后，Actions 页面选 build-macos → Run workflow。
+# 用法二（自动）：打 tag（如 v1.0.0）推送，除产出 artifact 外还会附加到 Release。
+#
+# 产物：DouyinDesktop-macOS-<版本>.zip，内含 douyin_desktop.app（Apple Silicon 原生）。
+# 下载位置：仓库 Actions 对应运行的 Artifacts 区（保留 30 天）。
+name: build-macos
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  macos:
+    runs-on: macos-14 # Apple Silicon（M1）
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.9 # 与 pubspec.lock 要求（>=3.47.0）及本机版本一致
+          channel: stable
+          cache: true
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 静态分析（只报告，不拦构建）
+        run: flutter analyze lib
+        continue-on-error: true
+
+      - name: 构建 macOS Release
+        run: flutter build macos --release
+
+      - name: 读取版本号
+        id: ver
+        run: echo "version=$(grep '^version:' pubspec.yaml | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: 打包 .app（保留签名与符号链接）
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/macos/Build/Products/Release/douyin_desktop.app \
+            "DouyinDesktop-macOS-${{ steps.ver.outputs.version }}.zip"
+          ls -lh DouyinDesktop-macOS-*.zip
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouyinDesktop-macOS-${{ steps.ver.outputs.version }}
+          path: DouyinDesktop-macOS-*.zip
+          retention-days: 30
+
+      - name: 附加到 Release（仅打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DouyinDesktop-macOS-*.zip

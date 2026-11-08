@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- 拉取抖音接口与视频流需要出站网络；没有这一项，沙盒内的 .app 无法联网。 -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- 允许加载非同一签名主体的 libmpv / Mpv.framework（自带的动态库）。
+	     代价：绕过 dyld 的库校验，理论上可被替换同目录下的 dylib 提权，
+	     因此只在本应用自己的 Frameworks 目录内使用，不要放进可写目录。 -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>
