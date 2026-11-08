@@ -165,9 +165,15 @@ class _SettingsPageState extends State<SettingsPage> {
               const SizedBox(height: 8),
               Wrap(
                 spacing: 8,
+                runSpacing: 8,
                 children: [
+                  // 键必须和 `heightOfQualityLabel` 能识别的写法一致：
+                  // 1440P / 2160P 是接口 gear 里的真实高度，
+                  // 直接写 '2K' / '4K' 换算不出高度，会退化到自动档。
                   for (final entry in const {
                     'auto': '自动',
+                    '2160P': '4K',
+                    '1440P': '2K',
                     '1080P': '1080P',
                     '720P': '720P',
                     '540P': '540P',
@@ -179,7 +185,10 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                 ],
               ),
-              const _Hint('切换清晰度只影响之后打开的作品；当前正在播放的不会中断。'),
+              const _Hint('切换清晰度只影响之后打开的作品；当前正在播放的不会中断。'
+                  '作品没有对应档位时按「不超过所选上限的最高档」播放。'
+                  '2K/4K 会显著增加显存与内存占用，集显机器（如 Intel UHD）'
+                  '建议保持 1080P 及以下。'),
             ],
           ),
           const SizedBox(height: 16),

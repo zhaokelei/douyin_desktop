@@ -168,8 +168,27 @@ class _PlayerPageState extends State<PlayerPage>
   /// 用户偏好：`auto` 或某个档位标签。持久化，下次启动沿用。
   String _qualityPref = 'auto';
 
-  /// 内存保护上限：任何自动/偏好档位都不会超过这一档（见 [_pickVariant]）。
-  static const String _memoryQualityCap = '1080P';
+  /// 内存保护上限：**只对“自动”档生效**，用户显式选了 2K/4K 就按他选的来。
+  ///
+  /// 历史做法是无论用户选什么都压回 1080P（因为 1440P 单条实测稳定
+  /// ~540MB），但这让设置页里的 4K/2K 变成了摆设——选了也不生效。
+  /// 现在改成：自动档用这个上限（防止一上来就顶最高码率），
+  /// 手动选档完全尊重用户，只在界面上给出内存提示。
+  static const String _autoQualityCap = '1080P';
+
+  /// 明确请求 4K / 2K 时的内存提醒只弹一次，避免反复打扰。
+  bool _hiResWarned = false;
+
+  /// 各 CDN host 是否支持 HTTP Range（206），null 表示尚未探测。
+  ///
+  /// 为什么需要这个：抖音的播放地址可能重定向到不同 CDN，历史上遇到过
+  /// “带 Range 直接 404”的情况，于是把 `seekable` 一刀切成 0——副作用是
+  /// **整条流彻底不可 seek**，连拖进度条都不行。不同 host 表现并不一致，
+  /// 所以这里逐个探测、只对确认不支持的 host 关掉 Range。
+  static final Map<String, bool?> _rangeSupportByHost = {};
+
+  /// 已经发起过探测的 host，避免重复探测。
+  static final Set<String> _rangeProbing = {};
 
   /// 当前实际生效的档位标签；空串表示未知（界面只显示"自动"，不猜）。
   String _activeQuality = '';
@@ -419,13 +438,14 @@ class _PlayerPageState extends State<PlayerPage>
     }));
     _subscriptions.add(_player.stream.error.listen((event) {
       diag('mpv-error', event);
-      // 在线流（seekable=0）的 seek 失败会以错误事件抛出，原文是
-      // “You can force it with '--force-seekable=yes'.”。
-      // 我们不能把这句话甩给用户，也不该让它挡住播放：吞掉即可，
-      // 真正的拖动入口 _seekTo 已经保证在线不走 seek。
+      // seek 相关的错误仍然只记日志、不弹给用户：
+      // mpv 的原话是英文（“You can force it with '--force-seekable=yes'.”），
+      // 甩到界面上没有意义。
+      // 现在在线直连也会真的尝试 seek，这类错误可能出现，但是否"成功"
+      // 由 _seekOnlineDirect 用 time-pos 实测校验，失败时才给中文提示。
       final lower = event.toLowerCase();
       if (lower.contains('seek')) {
-        diag('seek', '忽略在线 seek 错误（已改为本地缓存后 seek）：$event');
+        diag('seek', 'seek 相关错误（已交给位置校验处理，不打扰用户）：$event');
         return;
       }
       // 硬解相关的错误不能直接弹给用户：先记日志，再静默降级到软解并重开。
@@ -847,19 +867,30 @@ class _PlayerPageState extends State<PlayerPage>
       } catch (e) {
         diag('mpv', '设置 vd-lavc-threads 失败: $e');
       }
-      // 抖音 aweme/v1/play 的签名地址只接受不带 Range 的普通 GET：
-      // 带 Range 会被服务端直接 404（实测 bytes=0-1023 → 404，无 Range → 200）。
-      // 而 libavformat 的 http 默认会发 Range 探测，导致 mpv 报 "Failed to open"。
-      // 关掉 seekable 后 ffmpeg 不再发 Range，代价是拖进度条会重新拉流。
+      // 允许在“没有服务端 Range”的流上做 mpv 层面能做的 seek。
+      //
+      // mpv 对不可 seek 的流默认直接拒绝 seek（报
+      // “You can force it with '--force-seekable=yes'.”）。打开它之后：
+      //   * 目标位置已经在 demuxer 内存缓存里 → 立刻跳过去，零网络请求；
+      //   * 目标在缓存前面（已播过、还在 back buffer 里）→ 也能跳回；
+      //   * 目标在缓存后面 → mpv 向前读并丢弃，慢但可用。
+      // 抖音短视频大多 3~8MB，配合 16MB 缓存基本全程可拖。
       try {
-        await platform.setProperty('stream-lavf-o', 'seekable=0');
-        final lavfO = await platform.getProperty('stream-lavf-o');
-        diag('mpv', 'stream-lavf-o=$lavfO（禁用 Range 探测，兼容抖音播放地址）');
+        await platform.setProperty('force-seekable', 'yes');
       } catch (e) {
-        diag('mpv', '设置 stream-lavf-o 失败: $e');
+        diag('mpv', '设置 force-seekable 失败（不影响播放）: $e');
       }
+      // 这里**不再**全局写死 stream-lavf-o=seekable=0。
+      //
+      // 原实现的出发点是“抖音签名地址带 Range 会 404”，但那条结论只对
+      // 部分 CDN host 成立（同仓库 models.dart 里另有 `aweme/v1/play`
+      // 实测 206 的记录）。全局关掉 seekable 的副作用很重：整个流变成
+      // 不可 seek，连拖进度条都不行。
+      //
+      // 现在把判定挪到 [_applyStreamSeekable]，按每个 host 的实际
+      // Range 支持情况逐个决定，未探测过的先用安全值保证能播。
       _mpvConfigured = true;
-      diag('mpv', '全局属性已设置（缓存上限 16MB/8MB，解码线程=2，keep-open=no）');
+      diag('mpv', '全局属性已设置（缓存上限 16MB/8MB，解码线程=2，seekable 按 host 判定）');
 
       // 首帧问题：音频解码总是比视频首帧快（视频还要过 D3D11 解码 + 提交到
       // Flutter texture），默认行为下会出现"黑屏但声音先出来"。
@@ -1179,23 +1210,123 @@ class _PlayerPageState extends State<PlayerPage>
     await _openCurrent();
   }
 
-  /// 打开媒体前切换 `stream-lavf-o`。
+  /// 本地文件：清掉 `stream-lavf-o`，恢复 ffmpeg 默认（可 seek）。
   ///
-  /// 在线抖音地址带 Range 会 404，所以流必须统一标成 `seekable=0`；
-  /// 本地缓存文件天然可 seek，这个属性对它没有影响。
-  /// 该属性只在打开流时读取，因此每次 open 前设一次即可。
-  Future<void> _applyStreamSeekable() async {
+  /// 上一轮如果给在线 host 设过 `seekable=0`，这个值会留在 mpv 上，
+  /// 切到本地缓存文件后必须显式清掉，否则本地文件也会被当成不可 seek。
+  Future<void> _setStreamSeekableDefault() async {
     final platform = _player.platform;
     if (platform is! NativePlayer) return;
-    const value = 'seekable=0';
+    try {
+      final current = (await platform.getProperty('stream-lavf-o')).trim();
+      if (current.isEmpty) return;
+      await platform.setProperty('stream-lavf-o', '');
+      diag('mpv', 'stream-lavf-o 清空（本地文件，恢复默认可 seek）');
+    } catch (e) {
+      diag('mpv', '清空 stream-lavf-o 失败：$e');
+    }
+  }
+
+  /// 打开媒体前按目标地址决定 `stream-lavf-o`。
+  ///
+  /// 历史做法是一律 `seekable=0`（注释称“在线抖音地址带 Range 会 404”），
+  /// 代价是**整条流不可 seek**，于是“关掉缓存就不能拖进度条”。
+  /// 但同一个仓库的 models.dart 里又记着 `aweme/v1/play` 实测返回
+  /// **206**（Range 生效）——两条记录互相矛盾，说明当初的结论至少
+  /// 不是对所有 host 都成立。
+  ///
+  /// 现在改成按 host 逐个判定：
+  ///   * 探测确认支持 Range → 保持默认（不设 seekable），可以任意 seek；
+  ///   * 探测确认不支持 → 设 `seekable=0`，保证能播（失去任意 seek）；
+  ///   * 尚未探测 → 先用安全值 `seekable=0`，同时后台探测，
+  ///     下一次 open 起用探测结果。
+  ///
+  /// 探测只发一个 2 字节的 Range 请求，代价可以忽略。
+  Future<void> _applyStreamSeekable(String url) async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    final host = Uri.tryParse(url)?.host ?? '';
+    if (host.isEmpty) return;
+    // 首次见到这个 host：先沿用安全值保证能播，探测放到后台。
+    if (!_rangeSupportByHost.containsKey(host)) {
+      unawaited(_probeRangeSupport(host, url));
+      try {
+        await platform.setProperty('stream-lavf-o', 'seekable=0');
+        diag('mpv', 'stream-lavf-o=seekable=0（$host 尚未探测，先保证可播）');
+      } catch (e) {
+        diag('mpv', '设置 stream-lavf-o 失败：$e');
+      }
+      return;
+    }
+    final supports = _rangeSupportByHost[host];
+    final value = supports == true ? '' : 'seekable=0';
     try {
       final current = (await platform.getProperty('stream-lavf-o')).trim();
       if (current == value) return;
       await platform.setProperty('stream-lavf-o', value);
-      diag('mpv', 'stream-lavf-o=$value（在线流关闭 Range）');
+      diag('mpv', 'stream-lavf-o=${value.isEmpty ? "<默认>" : value}'
+          '（$host Range=${supports == true ? "支持" : "不支持"}）');
     } catch (e) {
       diag('mpv', '设置 stream-lavf-o 失败：$e');
     }
+  }
+
+  /// 探测某 host 是否支持 HTTP Range：发 `Range: bytes=0-1`，
+  /// 返回 206 且拿到 2 字节即为支持。
+  ///
+  /// 只做一次（[_rangeProbing] 去重），结果写进 [_rangeSupportByHost]。
+  ///
+  /// 探测是在 open 之后并行跑的（不能阻塞播放），所以**当前这一条**仍然
+  /// 处于 `seekable=0`。探测确认支持 Range 时，用新的 seekable 值重开一次
+  /// 当前视频并跳回原位置——这样用户第一次进来拖动也能生效，而不是要等
+  /// 切下一条才学会。
+  ///
+  /// 只在“用户在播这条、且没有正在切换”时重开，避免打断正在进行的操作。
+  Future<void> _probeRangeSupport(String host, String url) async {
+    if (!_rangeProbing.add(host)) return;
+    HttpClient? client;
+    var ok = false;
+    try {
+      client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 8)
+        ..userAgent = PlatformAdapter.userAgent;
+      final req = await client.getUrl(Uri.parse(url));
+      req.headers.set('Referer', 'https://www.douyin.com/');
+      req.headers.set('Range', 'bytes=0-1');
+      final res = await req.close();
+      ok = res.statusCode == 206;
+      // 必须把 body 读掉，否则连接不会释放。
+      await res.drain<void>();
+      _rangeSupportByHost[host] = ok;
+      diag('cache-rangesupport',
+          '$host Range 探测：HTTP ${res.statusCode} → ${ok ? "支持" : "不支持"}');
+    } catch (e) {
+      _rangeSupportByHost[host] = false;
+      diag('cache-rangesupport', '$host Range 探测失败（按不支持处理）：$e');
+    } finally {
+      client?.close(force: true);
+      _rangeProbing.remove(host);
+    }
+    if (!ok || !mounted) return;
+    // 探测期间用户可能已经切走 / 正在切换 / 已经在播本地缓存：
+    // 这些情况都不要重开，避免打断。
+    if (_switching || _localPath != null || _cacheMode != CacheMode.off) return;
+    final currentUrl = _currentPlayUrl();
+    if (currentUrl.isEmpty || (Uri.tryParse(currentUrl)?.host ?? '') != host) {
+      return;
+    }
+    final pos = _player.state.position;
+    diag('cache-rangesupport',
+        '$host 支持 Range，重开当前条以启用任意 seek（保留 ${pos.inMilliseconds}ms）');
+    // 走 _openCurrent 而不是直接 _openCurrentInner：前者带 _switching 互斥，
+    // 能挡住"探测刚回来、用户同时切下一条"的并发重开。
+    unawaited(_openCurrent(seekTo: pos > Duration.zero ? pos : null));
+  }
+
+  /// 当前条正在播放的地址（与 open 时的取法保持一致）。
+  String _currentPlayUrl() {
+    final v = _pickVariant(_current.variants, _qualityPref);
+    return v?.url ?? _current.playUrl;
   }
 
   /// 错误浮层的"重试"：清掉当前错误，重新走完整的 open → 首帧确认流程。
@@ -1355,9 +1486,13 @@ class _PlayerPageState extends State<PlayerPage>
       diag('player',
           'media 来源=${local != null ? "磁盘缓存" : "在线"} '
           'hwdec=${_hardware ? "on" : "off"} seekable=${local != null}');
-      // 本地文件可 seek；在线抖音地址带 Range 会 404，必须关掉 seekable。
+      // 本地文件天然可 seek；在线流按 host 的实际 Range 支持情况决定。
       // 这个属性在打开流时读取，所以每次 open 前按来源切一次。
-      await _applyStreamSeekable();
+      if (local != null) {
+        await _setStreamSeekableDefault();
+      } else {
+        await _applyStreamSeekable(useUrl);
+      }
       _completed = false;
       await _player.open(media, play: false);
       // 切清晰度时保持进度：必须等媒体解析完（宽高可用）再 seek，
@@ -1504,8 +1639,14 @@ class _PlayerPageState extends State<PlayerPage>
   /// 拖动进度统一入口。
   ///
   /// 本地文件：直接 seek。
-  /// 在线文件（seekable=0）：绝不在线 seek（那正是 “force-seekable=yes”
-  /// 报错的来源），改为切换到本地缓存文件后再 seek；缓存还没好就延后补跳。
+  /// 在线直连（缓存关闭）：直接 seek。能否生效取决于两件事——
+  ///   1. mpv 的 demuxer cache 里是否已经有目标位置的数据
+  ///      （本项目设了 `cache=yes` + `demuxer-max-bytes=16MB`，
+  ///       抖音短视频多为 3~8MB，播一两秒后整条就进内存了，
+  ///       缓存范围内的 seek 不需要服务端支持 Range）；
+  ///   2. 缓存外的前跳则由 mpv 向前读并丢弃。
+  /// 所以「缓存关闭就不能拖」是原实现的自我限制，不是技术约束。
+  /// 这里改为真的去 seek，并在稍后校验是否跳成功，失败才给提示。
   void _seekTo(Duration target) {
     _resetHideTimer();
     if (_completed) {
@@ -1522,13 +1663,52 @@ class _PlayerPageState extends State<PlayerPage>
       diag('seek', '缓存源 seek → ${target.inMilliseconds}ms');
       return;
     }
-    if (_cacheMode == CacheMode.off) {
-      // 用户显式关了缓存：在线流不可 seek，给提示而不是让 mpv 报错。
-      diag('seek', '缓存已关闭，忽略在线拖动 ${target.inMilliseconds}ms');
-      _toast('缓存已关闭，在线播放暂不支持拖动进度');
+    // 在线：先直接 seek（快），跳不动再按缓存模式决定退路。
+    unawaited(_seekOnlineDirect(target));
+  }
+
+  /// 在线拖动：先直接 seek，再校验真的跳过去了；失败才走退路。
+  ///
+  /// 为什么不再“先下完再跳”：那是原实现的做法，等一整条视频下完
+  /// （几 MB 到几十 MB）才响应拖动，用户会觉得进度条卡死。
+  /// 而 mpv 的 demuxer cache + force-seekable 通常能立刻跳过去：
+  ///   * 目标在已缓冲范围内 → 零网络请求，瞬时；
+  ///   * 目标在缓存后 → mpv 向前读并丢弃，短视频也就一两秒。
+  ///
+  /// 校验是必须的——mpv 对不可 seek 的流收到 seek 命令时不一定抛错，
+  /// 有时只是静默忽略。静默忽略时如果 UI 直接把进度条挪到目标位置，
+  /// 用户会以为跳成功了，然后发现画面还在原处。所以这里等一小段再
+  /// 对比 `time-pos`，用事实说话。
+  Future<void> _seekOnlineDirect(Duration target) async {
+    final gen = _openGeneration;
+    diag('seek', '在线 seek → ${target.inMilliseconds}ms');
+    try {
+      await _player.seek(target);
+    } catch (e) {
+      // 不可 seek 的流会以错误事件抛出，原文是
+      // “You can force it with '--force-seekable=yes'.”。
+      // 不是致命错误，交给下面的校验统一处理，避免日志里出现英文原文。
+      diag('seek', '在线 seek 抛错（继续校验实际位置）: $e');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    if (!mounted || gen != _openGeneration) return;
+    final actual = _player.state.position;
+    final diff = (actual - target).inMilliseconds.abs();
+    // 播放中位置本来就在前进，留 1.5s 容差足够区分“跳成功”与“没动”。
+    if (diff <= 1500) {
+      diag('seek',
+          '在线 seek 生效 → 实际 ${actual.inMilliseconds}ms（目标 ${target.inMilliseconds}ms）');
       return;
     }
-    unawaited(_seekViaCache(target));
+    diag('seek',
+        '在线 seek 未生效：目标 ${target.inMilliseconds}ms 实际 ${actual.inMilliseconds}ms');
+    // 退路：开着缓存就退回「下载到本地再跳」，关着缓存只能提示。
+    if (_cacheMode != CacheMode.off) {
+      diag('seek', '直连 seek 失败，退回缓存后跳转');
+      await _seekViaCache(target);
+      return;
+    }
+    _toast('这条视频还没缓到该位置，稍等几秒再拖；或在设置里开启缓存后可任意拖动');
   }
 
   Future<void> _seekViaCache(Duration target) async {
@@ -2980,18 +3160,22 @@ class _PlayerPageState extends State<PlayerPage>
   /// 按偏好选档：用户选中的档位是「上限」，不是「必须精确命中」。
   ///
   /// 具体比较规则见 [pickVariantUnderCap]（models.dart，可被工具脚本直接测试）。
-  /// 自动档位逻辑保持不变。
+  ///
+  /// 手动选档（含 2K/4K）**完全尊重用户选择**，不再强行压回 1080P：
+  /// 之前那道 `_memoryQualityCap` 会让设置页里的 4K/2K 变成摆设——选了
+  /// 也不生效，用户看到的是“没有 4K 选项 / 选了也没用”。
+  /// 内存保护只保留在「自动」档上（[_pickAuto] 用播放区物理高度做上限）。
   VideoVariant? _pickVariant(List<VideoVariant> variants, String pref) {
     if (variants.isEmpty) return null;
-    // 内存上限：默认最高只取 1080P。1440P/4K 的单帧纹理 + d3d11 解码缓冲
-    // 让每次切视频的内存台阶明显变大（实测 1440P 单条稳定 ~540MB）。
-    final prefHeight = heightOfQualityLabel(pref);
-    final capped = prefHeight != null && prefHeight > 1080;
-    final effective = capped ? _memoryQualityCap : pref;
-    if (effective == 'auto') return _pickAuto(variants);
-    final chosen = pickVariantUnderCap(variants, effective);
-    if (capped && chosen != null) {
-      diag('player', '内存上限生效：偏好 $pref → 实际 ${chosen.label}');
+    if (pref == 'auto') return _pickAuto(variants);
+    final chosen = pickVariantUnderCap(variants, pref);
+    // 用户明确要了 2K/4K：只提醒一次内存代价，不阻止。
+    if (!_hiResWarned) {
+      final h = heightOfQualityLabel(pref);
+      if (h != null && h > 1080) {
+        _hiResWarned = true;
+        diag('player', '用户选择 $pref（${h}p）：显存/内存占用会明显上升');
+      }
     }
     return chosen ?? _pickAuto(variants);
   }
@@ -3011,8 +3195,10 @@ class _PlayerPageState extends State<PlayerPage>
     }
     final target = _viewportPhysicalHeight();
     var cap = target + target ~/ 10;
-    // 自动档同样封顶 1080P，避免高 DPI/大窗口下自动挑到 1440P 以上。
-    if (cap > 1080) cap = 1080;
+    // 自动档封顶：用户没明确指定时不要自作主张挑 2K/4K——
+    // 自动档的职责是“够看且省资源”，高分辨率要用户自己选。
+    final autoCap = heightOfQualityLabel(_autoQualityCap);
+    if (autoCap != null && cap > autoCap) cap = autoCap;
     VideoVariant best = withHeight.first;
     for (final v in withHeight) {
       if (v.height <= cap) best = v;
@@ -3027,16 +3213,21 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 控制条档位文案。自动模式下当前档位未知时只显示"自动"，
   /// 不猜一个可能错误的档位名。
+  /// 展示统一走 [_QualitySheet.displayName]，让 2160P/1440P 显示成 4K/2K。
   String get _qualityLabel {
     if (_current.isImage) return '图文';
     if (_qualityPref == 'auto') {
-      return _activeQuality.isEmpty ? '自动' : '自动·$_activeQuality';
+      return _activeQuality.isEmpty
+          ? '自动'
+          : '自动·${_QualitySheet.displayName(_activeQuality)}';
     }
     // 用户选了某档，但当前作品没有这一档（已回落）：显示实际生效的档位，
     // 不能把选不中的偏好当成当前档位显示。
-    if (_activeQuality.isEmpty) return _qualityPref;
-    if (_activeQuality != _qualityPref) return _activeQuality;
-    return _qualityPref;
+    if (_activeQuality.isEmpty) return _QualitySheet.displayName(_qualityPref);
+    if (_activeQuality != _qualityPref) {
+      return _QualitySheet.displayName(_activeQuality);
+    }
+    return _QualitySheet.displayName(_qualityPref);
   }
 
   Future<void> _showQualityPicker() async {
@@ -4056,6 +4247,20 @@ class _QualitySheet extends StatelessWidget {
     Navigator.of(context).pop(value);
   }
 
+  /// 档位显示名：把接口的像素高度写法换成用户熟悉的叫法。
+  /// 内部一律用 `2160P` / `1440P` 作为键（设置页、偏好持久化都用它），
+  /// 只有展示时才变成 4K / 2K，避免两处叫法不一致让人以为“没有 4K”。
+  static String displayName(String label) {
+    switch (label) {
+      case '2160P':
+        return '4K（2160P）';
+      case '1440P':
+        return '2K（1440P）';
+      default:
+        return label;
+    }
+  }
+
   Widget _tile(
       BuildContext context, String value, String title, String? subtitle) {
     final selected = pref == value;
@@ -4100,14 +4305,16 @@ class _QualitySheet extends StatelessWidget {
               context,
               'auto',
               '自动',
-              active.isEmpty ? '按播放区大小与流畅度自动选择' : '当前命中 $active',
+              active.isEmpty
+                  ? '按播放区大小与流畅度自动选择'
+                  : '当前命中 ${displayName(active)}',
             ),
             const Divider(height: 1, color: Color(0x26FFFFFF)),
             for (final v in variants.reversed)
               _tile(
                 context,
                 v.label,
-                v.label,
+                displayName(v.label),
                 v.bitRate > 0
                     ? '码率 ${(v.bitRate / 1000000).toStringAsFixed(1)} Mbps'
                     : null,
@@ -4116,8 +4323,9 @@ class _QualitySheet extends StatelessWidget {
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 6, 20, 0),
                 child: Text(
-                  '当前作品没有 $pref 档，已按 $pref 上限选了 '
-                  '${active.isEmpty ? "自动" : active}；后续作品会继续以上限挑档',
+                  '当前作品没有 ${displayName(pref)} 档，已按该上限选了 '
+                  '${active.isEmpty ? "自动" : displayName(active)}；'
+                  '后续作品会继续以上限挑档',
                   style: const TextStyle(
                       fontSize: 11.5, color: Color(0xFFFFA726), height: 1.4),
                 ),
