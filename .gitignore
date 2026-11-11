@@ -54,3 +54,15 @@ douyin_cookies.json
 
 # 本地构建工具（Flutter SDK 压缩包、VS 安装器等，体积巨大，绝不入库）
 .build_tools/
+
+# GitHub 本地凭据与 device-flow 临时码：仓库已公开，绝不能入库。
+# 这些文件只在本机工作区使用（触发 workflow / 下载 artifact），
+# 已通过 git filter-branch 从全部历史提交中清除。
+gh_token.txt
+gh_device.json
+gh_device_code.txt
+
+# 本地诊断/构建临时产物
+/macos_out/
+jobs_dump.json
+flutter_releases.json
