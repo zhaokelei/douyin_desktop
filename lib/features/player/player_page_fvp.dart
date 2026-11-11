@@ -1733,12 +1733,16 @@ class _PlayerPageState extends State<PlayerPage>
       }
     } finally {
       // 不在 open() 返回时就撤遮罩：此时首帧往往还没到，会露出黑屏。
-      // 兜底：属性读不到时最多等 2 秒（轮询本身 1.5s 超时），之后也要按
-      // "先亮画面、再恢复音量"的顺序放行，避免一直转圈或一直静音。
+      // 兜底：属性读不到时也要按"先亮画面、再恢复音量"的顺序放行，
+      // 避免一直转圈或一直静音。
+      //
+      // 4.5s 而不是原来的 2s：这条兜底是**无条件放行**，一旦早于真实首帧
+      // 触发就是一次黑闪。4.5s 比 _awaitFirstFrameThenUnmute 的 4s 上限
+      // 再晚一点，正常路径永远轮不到它，只有轮询本身异常时才生效。
       _firstFrameTimer?.cancel();
-      _firstFrameTimer = Timer(const Duration(seconds: 2), () {
+      _firstFrameTimer = Timer(const Duration(milliseconds: 4500), () {
         if (!mounted || gen != _openGeneration) return;
-        diag('avsync', '首帧等待兜底超时（2s），按顺序放行');
+        diag('avsync', '首帧等待兜底超时（4.5s），按顺序放行');
         _revealFirstFrame(gen);
       });
     }
@@ -1981,7 +1985,15 @@ class _PlayerPageState extends State<PlayerPage>
     var vfFps = 0.0;
     var okSamples = 0;
     var samples = 0;
-    final deadline = DateTime.now().add(const Duration(milliseconds: 1500));
+    // 上限 4s（原 1.5s）。
+    //
+    // 1.5s 是给 mpv 设的：判据读不到就快速放行，别让用户干等。但 fvp/libmdk
+    // 的首帧要 ~2.2s（prepare 300ms + 解码器初始化 + 首帧渲染），1.5s 到期时
+    // **画面还没出来**，却照样撤了遮罩 → 露一帧黑底 = 用户说的"切换闪屏"。
+    //
+    // 而且这里放宽是安全的：`_opening` 为真时盖的是封面（不是黑屏），
+    // 多等两秒只是封面多停一会儿；而提前撤遮罩的代价是实打实的黑闪。
+    final deadline = DateTime.now().add(const Duration(milliseconds: 4000));
     while (DateTime.now().isBefore(deadline)) {
       if (!mounted || _firstFrameShown || gen != _openGeneration) return;
       try {
