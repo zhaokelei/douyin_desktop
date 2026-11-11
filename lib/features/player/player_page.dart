@@ -128,6 +128,15 @@ class _PlayerPageState extends State<PlayerPage>
   bool _opening = false;
   bool _switching = false;
 
+  /// 遮罩已撤、但封面还在做 180ms 淡出的这段窗口。
+  ///
+  /// 过渡必须发生在**普通图片层**上：视频纹理一旦被 Opacity 包住，合成器就要
+  /// 开离屏 surface 再混合一次，macOS（CVPixelBuffer → FlutterTexture）上会
+  /// 采到未对齐的平面，表现为切换瞬间的花纹/斜向马赛克。
+  /// 所以视频层用 Offstage 硬切显隐，观感上的"化出来"交给这层封面淡出。
+  bool _coverFading = false;
+  Timer? _coverFadeTimer;
+
   /// 在途 open 的起始时刻：看门狗据此判断"这次 open 是不是卡住了"。
   DateTime? _switchStartedAt;
 
@@ -1614,11 +1623,15 @@ class _PlayerPageState extends State<PlayerPage>
       _diggBusy = false;
       _collectBusy = false;
       _opening = true;
+      _coverFading = false;
       _firstFrameShown = false;
       _playError = null;
       _position = Duration.zero;
       _duration = Duration.zero;
     });
+    // 上一条的封面淡出必须掐掉，否则新一条会带着上一轮的 _coverFading
+    // 直接跳过封面，开局露一帧黑。
+    _coverFadeTimer?.cancel();
 
     diag('player',
         'open aweme=${item.id} pref=$_qualityPref quality=${chosen?.label ?? "unknown"} '
@@ -1720,12 +1733,16 @@ class _PlayerPageState extends State<PlayerPage>
       }
     } finally {
       // 不在 open() 返回时就撤遮罩：此时首帧往往还没到，会露出黑屏。
-      // 兜底：属性读不到时最多等 2 秒（轮询本身 1.5s 超时），之后也要按
-      // "先亮画面、再恢复音量"的顺序放行，避免一直转圈或一直静音。
+      // 兜底：属性读不到时也要按"先亮画面、再恢复音量"的顺序放行，
+      // 避免一直转圈或一直静音。
+      //
+      // 4.5s 而不是原来的 2s：这条兜底是**无条件放行**，一旦早于真实首帧
+      // 触发就是一次黑闪。4.5s 比 _awaitFirstFrameThenUnmute 的 4s 上限
+      // 再晚一点，正常路径永远轮不到它，只有轮询本身异常时才生效。
       _firstFrameTimer?.cancel();
-      _firstFrameTimer = Timer(const Duration(seconds: 2), () {
+      _firstFrameTimer = Timer(const Duration(milliseconds: 4500), () {
         if (!mounted || gen != _openGeneration) return;
-        diag('avsync', '首帧等待兜底超时（2s），按顺序放行');
+        diag('avsync', '首帧等待兜底超时（4.5s），按顺序放行');
         _revealFirstFrame(gen);
       });
     }
@@ -1968,7 +1985,15 @@ class _PlayerPageState extends State<PlayerPage>
     var vfFps = 0.0;
     var okSamples = 0;
     var samples = 0;
-    final deadline = DateTime.now().add(const Duration(milliseconds: 1500));
+    // 上限 4s（原 1.5s）。
+    //
+    // 1.5s 是给 mpv 设的：判据读不到就快速放行，别让用户干等。但 fvp/libmdk
+    // 的首帧要 ~2.2s（prepare 300ms + 解码器初始化 + 首帧渲染），1.5s 到期时
+    // **画面还没出来**，却照样撤了遮罩 → 露一帧黑底 = 用户说的"切换闪屏"。
+    //
+    // 而且这里放宽是安全的：`_opening` 为真时盖的是封面（不是黑屏），
+    // 多等两秒只是封面多停一会儿；而提前撤遮罩的代价是实打实的黑闪。
+    final deadline = DateTime.now().add(const Duration(milliseconds: 4000));
     while (DateTime.now().isBefore(deadline)) {
       if (!mounted || _firstFrameShown || gen != _openGeneration) return;
       try {
@@ -2055,8 +2080,20 @@ class _PlayerPageState extends State<PlayerPage>
       _unmuteAfterFirstFrame();
       return;
     }
-    if (_opening) setState(() => _opening = false);
-    diag('avsync', '遮罩已撤（画面开始淡入），等待画面真实可见后再出声（gen=$gen）');
+    if (_opening) {
+      setState(() {
+        _opening = false;
+        // 视频层是 Offstage 硬切的（不能对纹理做透明度合成），
+        // "化出来"的效果交给封面淡出这 180ms。
+        _coverFading = true;
+      });
+      _coverFadeTimer?.cancel();
+      _coverFadeTimer = Timer(const Duration(milliseconds: 220), () {
+        if (!mounted) return;
+        setState(() => _coverFading = false);
+      });
+    }
+    diag('avsync', '遮罩已撤（封面淡出，画面开始显影），等待画面真实可见后再出声（gen=$gen）');
     // 首帧出现 = 解码器已经真正工作，此时核对硬解是否生效最准确。
     unawaited(_verifyHardwareDecode(gen));
     unawaited(_unmuteWhenVisible(gen));
@@ -2951,6 +2988,7 @@ class _PlayerPageState extends State<PlayerPage>
     _hideTimer?.cancel();
     _propertyTimer?.cancel();
     _firstFrameTimer?.cancel();
+    _coverFadeTimer?.cancel();
     _loadDeadlineTimer?.cancel();
     _switchWatchdog?.cancel();
     _pendingOpen = null;
@@ -3157,16 +3195,20 @@ class _PlayerPageState extends State<PlayerPage>
 
                             // 视频层本体：结构**恒定**，切换动画结束后不会被
                             // 重挂载（重挂载 = Texture 重建 = 闪一下）。
+                            //
+                            // 关键：这一层**不能**再套 Opacity / AnimatedOpacity。
+                            // 外部视频纹理在合成器里是"外部纹理层"，一旦被 Opacity
+                            // 包住就必须进离屏 surface 混合；macOS 上（CVPixelBuffer
+                            // → FlutterTexture）实测会采到未对齐的平面，用户看到的
+                            // 就是「切换瞬间一片花纹马赛克 + 闪屏」。
+                            //
+                            // 显隐改用 Offstage：不绘制、不进合成层，而且 State 保留
+                            // （不会因为显隐重建 Texture）。过渡感由下面的封面淡出负责。
                             final videoLayer = Stack(
                               fit: StackFit.expand,
                               children: [
-                                // 首帧前：封面模糊占位，避免纯黑干等。
-                                // 不显示就不构建，省掉高斯模糊的 ImageFilterLayer。
-                                if (_opening) _CoverBlur(url: item.coverUrl),
-                                AnimatedOpacity(
-                                  opacity: _opening ? 0.0 : 1.0,
-                                  duration:
-                                      const Duration(milliseconds: 220),
+                                Offstage(
+                                  offstage: _opening,
                                   child: RepaintBoundary(
                                     key: _videoBoundaryKey,
                                     child: Video(
@@ -3179,16 +3221,41 @@ class _PlayerPageState extends State<PlayerPage>
                                     ),
                                   ),
                                 ),
+                                // 首帧前：封面占位，避免纯黑干等。
+                                // 撤遮罩后不立刻移除，而是淡出 180ms——画面就"化"出来了。
+                                if (_opening || _coverFading)
+                                  IgnorePointer(
+                                    child: AnimatedOpacity(
+                                      opacity: _opening ? 1.0 : 0.0,
+                                      duration:
+                                          const Duration(milliseconds: 180),
+                                      curve: Curves.easeOut,
+                                      child: _CoverBlur(url: item.coverUrl),
+                                    ),
+                                  ),
                               ],
                             );
 
                             final settled =
                                 raw >= 1.0 && _bounceCtrl.value == 0;
 
+                            // macOS：整段切换都不做位移+淡入。
+                            //
+                            //  1. 这里没有旧画面快照（抓图要走 GPU 回读，会污染
+                            //     字形图集，见 PlatformAdapter.mustAvoidGpuReadback），
+                            //     所以"黑底 + 新画面滑进来"根本不像抖音的整条滑走，
+                            //     反而把黑边露出来；
+                            //  2. 位移必然配合透明度淡入，而视频纹理不该参与透明度
+                            //     合成（见 videoLayer 的注释），两者是冲突的。
+                            //
+                            // 退化成「封面盖住 → 淡出露出视频」的硬切过渡，观感更接近
+                            // 抖音，也不会闪。
+                            final noSlide = PlatformAdapter.mustAvoidGpuReadback;
+
                             return LayoutBuilder(
                               builder: (context, constraints) {
                                 final h = constraints.maxHeight;
-                                final dy = settled
+                                final dy = (noSlide || settled)
                                     ? 0.0
                                     : _slideDir * h * 0.16 * (1 - t) -
                                         _bounceDir * 12.0 * bounce;
@@ -3209,19 +3276,18 @@ class _PlayerPageState extends State<PlayerPage>
                                     // 直接 paintChild）。所以静止期这两层
                                     // 完全等价于"没有包装"。
                                     //
-                                    // 轻微缩放（原 0.985→1.0）为性能让路去掉：
-                                    // 1.5% 的缩放肉眼几乎无感，但代价是每帧
-                                    // 一次 scale 合成。
+                                    // macOS 上 noSlide 为真时直接不包 Opacity：
+                                    // 视频纹理全程不参与任何透明度合成。
                                     FractionalTranslation(
                                       translation: Offset(
                                           0, h <= 0 ? 0 : dy / h),
-                                      child: Opacity(
-                                        opacity: settled
-                                            ? 1.0
-                                            : (0.45 + 0.55 * t)
-                                                .clamp(0.0, 1.0),
-                                        child: videoLayer,
-                                      ),
+                                      child: (noSlide || settled)
+                                          ? videoLayer
+                                          : Opacity(
+                                              opacity: (0.45 + 0.55 * t)
+                                                  .clamp(0.0, 1.0),
+                                              child: videoLayer,
+                                            ),
                                     ),
                                     // 旧画面滑出层：与进入方向相反，同时淡出。
                                     if (_outgoingFrame != null)
@@ -3248,32 +3314,38 @@ class _PlayerPageState extends State<PlayerPage>
                         ),
                         // 加载层：半透明暗化 + 进度圈 + 文案（封面占位在其下方）。
                         //
-                        // 只在 _opening 为真时构建。原来的写法用 AnimatedOpacity
-                        // 把它"藏"起来，但子树始终在渲染树里：即使肉眼看不见，
-                        // 每帧照样要布局 + 绘制一层全屏半透明色块，在核显上
-                        // 是白付的填充带宽。播放稳定期 _opening 恒为 false，
-                        // 所以这里直接不构建最划算。
-                        if (_opening)
+                        // 只在 _opening（或遮罩正在淡出）时构建。原来的写法用
+                        // AnimatedOpacity 把它"藏"起来，但子树始终在渲染树里：
+                        // 即使肉眼看不见，每帧照样要布局 + 绘制一层全屏半透明色块，
+                        // 在核显上是白付的填充带宽。播放稳定期这里恒为 false。
+                        //
+                        // 撤遮罩走 150ms 淡出而不是直接删：硬删会让转圈和暗化层
+                        // 在同一帧消失，配合下面的封面淡出就是一次明显的闪。
+                        if (_opening || _coverFading)
                           IgnorePointer(
-                            child: Container(
-                              color: const Color(0x59000000),
-                              alignment: Alignment.center,
-                              child: const Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  SizedBox(
-                                    width: 26,
-                                    height: 26,
-                                    child: CircularProgressIndicator(
-                                        strokeWidth: 2.4,
-                                        color: Colors.white70),
-                                  ),
-                                  SizedBox(height: 12),
-                                  Text('加载中…',
-                                      style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors.white70)),
-                                ],
+                            child: AnimatedOpacity(
+                              opacity: _opening ? 1.0 : 0.0,
+                              duration: const Duration(milliseconds: 150),
+                              child: Container(
+                                color: const Color(0x59000000),
+                                alignment: Alignment.center,
+                                child: const Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    SizedBox(
+                                      width: 26,
+                                      height: 26,
+                                      child: CircularProgressIndicator(
+                                          strokeWidth: 2.4,
+                                          color: Colors.white70),
+                                    ),
+                                    SizedBox(height: 12),
+                                    Text('加载中…',
+                                        style: TextStyle(
+                                            fontSize: 12,
+                                            color: Colors.white70)),
+                                  ],
+                                ),
                               ),
                             ),
                           ),

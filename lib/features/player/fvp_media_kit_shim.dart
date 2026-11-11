@@ -16,6 +16,7 @@
 // 行为的（hwdec / hwdec-current / width / height）做了语义映射。
 
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:fvp/mdk.dart' as mdk;
@@ -97,15 +98,35 @@ class NativePlayer {
   Future<String> getProperty(String name) async {
     switch (name) {
       case 'width':
-        return _owner._videoSize == null
+        return _owner.videoSize == null
             ? ''
-            : '${_owner._videoSize!.width.toInt()}';
+            : '${_owner.videoSize!.width.toInt()}';
       case 'height':
-        return _owner._videoSize == null
+        return _owner.videoSize == null
             ? ''
-            : '${_owner._videoSize!.height.toInt()}';
+            : '${_owner.videoSize!.height.toInt()}';
       case 'hwdec':
         return _owner._requestedHwdec;
+      // --- 首帧判定用的语义映射 -------------------------------------------
+      //
+      // 播放页的 `_awaitFirstFrameThenUnmute` 用 mpv 的
+      // `vo-configured` / `time-pos` 判断"画面真的出来了没有"。libmdk 没有
+      // vo 这个概念，以前这两个属性走 default 返回空串，于是判据永远不成立，
+      // 每条视频都只能等 1.5s 兜底超时才撤遮罩——画面其实早就出来了，
+      // 用户白看 1.5 秒转圈，而且兜底时机和真实出帧毫无关系，偶尔会撤早了
+      // 露出一帧黑底。
+      //
+      // 这里的映射是**有依据的**，不是为了让判据通过而硬编：
+      //   * `_displayTextureId` 非空 = 已经出过帧（它只在 position > 0 时发布）；
+      //   * `position` 由视频时钟驱动，只有渲染过帧才推进。
+      case 'vo-configured':
+        return (_owner._displayTextureId.value != null &&
+                _owner.videoSize != null)
+            ? 'yes'
+            : '';
+      case 'time-pos':
+        final ms = _owner._mdk.position;
+        return ms > 0 ? (ms / 1000).toStringAsFixed(3) : '';
       case 'hwdec-current':
         // libmdk 没有这个属性，用 onEvent 里记录的实际解码器名代替。
         // 返回的名字要能被 PlatformAdapter.isHardwareDecoder 识别。
@@ -183,8 +204,9 @@ class VideoController {
   final VideoControllerConfiguration configuration;
 
   /// media_kit 的 `VideoController.id` 是 `ValueNotifier<int?>`；
-  /// libmdk 的 `Player.textureId` 恰好也是同一个类型，直接透传。
-  ValueNotifier<int?> get id => player._mdk.textureId;
+  /// 这里不能直接透传 `player._mdk.textureId`，必须是"已经出过帧"的纹理
+  /// （原因见 [Player._displayTextureId]）。
+  ValueNotifier<int?> get id => player._displayTextureId;
 }
 
 // -------------------------------------------------------------------- Player
@@ -264,6 +286,7 @@ class Player {
       if (!_positionCtl.isClosed) {
         _positionCtl.add(Duration(milliseconds: pos));
       }
+      _maybePublishTexture();
       // 播放到结尾：模拟 media_kit 的 completed 流。
       if (!_completed && _durationMs > 0 && pos >= _durationMs - 120) {
         _completed = true;
@@ -274,10 +297,23 @@ class Player {
     // libmdk 的日志是全局回调，灰度期同时只存在一个 Player。
     mdk.setLogHandler((level, text) {
       if (_disposed || _logCtl.isClosed) return;
+      // debug 级默认不进日志。
+      //
+      // libmdk 的 debug 是**逐帧**级别的：一条 FrameReader 的
+      // load/state/packet 流水就上百行，实测 33 秒能写 881 条，占满
+      // 2000 条环形缓冲、把 4MB 文件快速轮转掉——用户复制出来的诊断
+      // 报告里全是没有信息量的噪音，真正有用的业务事件被挤没了。
+      //
+      // 需要看底层细节时用 DOUYIN_MPV_DEBUG=1 打开。
+      if (level.name == 'debug' && !_keepMdkDebug) return;
       if (_noisyLog.hasMatch(text)) return;
       _logCtl.add(LogEvent(level.name, text));
     });
   }
+
+  /// 是否保留 libmdk 的 debug 级日志（默认关，见构造函数里的说明）。
+  static final bool _keepMdkDebug =
+      Platform.environment['DOUYIN_MPV_DEBUG'] == '1';
 
   late final mdk.Player _mdk;
   late final NativePlayer _native;
@@ -299,6 +335,19 @@ class Player {
   bool _disposed = false;
   bool _completed = false;
 
+  /// 交给 UI 显示的纹理 id（`VideoController.id` 就返回它）。
+  ///
+  /// **不能**直接把 `_mdk.textureId` 透给界面。`updateTexture()` 的语义是
+  /// "release 旧纹理 + create 新纹理"：新纹理刚分配出来时显存里一帧数据都
+  /// 没有，Flutter 若在这一刻把它上屏，采到的就是未初始化显存——macOS 上
+  /// 实测就是用户说的「切换视频时一片花纹马赛克」。
+  ///
+  /// 所以要等解码器真的出帧之后再发布：mdk 的 `position` 由视频时钟驱动，
+  /// 只有渲染过帧才会 > 0。等不到（比如打开后一直暂停在 0 点）由
+  /// [_publishDeadline] 兜底，避免永远黑屏。
+  final ValueNotifier<int?> _displayTextureId = ValueNotifier<int?>(null);
+  Timer? _publishDeadline;
+
   /// 打开世代：后台补纹理时用来判断"这是不是当前这条媒体"。
   int _openSeq = 0;
 
@@ -317,7 +366,6 @@ class Player {
 
   int _durationMs = 0;
   double _volume = 100;
-  Size? _videoSize;
   String _requestedHwdec = PlatformAdapter.preferredHwdec;
   String _currentDecoder = '';
   String _streamLavfOpt = '';
@@ -327,7 +375,11 @@ class Player {
   PlayerState get state => _state;
 
   /// 供 Video widget 取纹理实际尺寸（按视频自身 dw/dh，不强制 16:9）。
-  Size? get videoSize => _videoSize;
+  ///
+  /// 用 notifier 而不是裸字段：尺寸可能是 open() 返回之后才由后台补上的，
+  /// `Video` 必须能被叫醒重排一次，否则会一直卡在"黑底 + 已知 textureId"。
+  Size? get videoSize => _videoSizeNotifier.value;
+  final ValueNotifier<Size?> _videoSizeNotifier = ValueNotifier<Size?>(null);
 
   void _applyDecoders(bool hardware) {
     if (!hardware) {
@@ -343,9 +395,34 @@ class Player {
     };
   }
 
+  /// 纹理已在、但还没出帧时不要发布（见 [_displayTextureId]）。
+  void _maybePublishTexture() {
+    if (_disposed) return;
+    final id = _mdk.textureId.value;
+    if (id == null || id < 0) return;
+    if (_displayTextureId.value == id) return;
+    // position > 0：解码器已经真的渲染过帧，显存里现在有画面。
+    if (_mdk.position <= 0) return;
+    _publishDeadline?.cancel();
+    _publishDeadline = null;
+    _displayTextureId.value = id;
+  }
+
+  /// `open()` 开头调用：旧纹理一律立刻撤掉。
+  ///
+  /// 播放页此时 `_opening = true`、视频层是 Offstage，看不到这一下黑；
+  /// 但如果留着旧 id，`Video` 会在新视频尺寸生效后拿旧纹理画一帧，
+  /// 那正是"切换闪一下"的来源。
+  void _resetTexture() {
+    _publishDeadline?.cancel();
+    _publishDeadline = null;
+    if (_displayTextureId.value != null) _displayTextureId.value = null;
+  }
+
   Future<void> open(Media media, {bool play = true}) async {
     _completed = false;
     final seq = ++_openSeq;
+    _resetTexture();
     if (!_completedCtl.isClosed) _completedCtl.add(false);
     _applyDecoders(_requestedHwdec != 'no');
 
@@ -385,11 +462,16 @@ class Player {
     // `_videoSize`；进入 `loading` 时它还会被换成一个新的 Completer。
     // 源码注释原话是 "that future may never complete"。旧实现直接
     // `await _mdk.textureSize`，坏源/EOF 后的重开场景就会永久卡死。
-    // 现在最多等 1.8 秒，等不到就放行 open，后台补上、补到再建纹理。
+    //
+    // 现在只等 450ms。原来等 1.8 秒，而实测这份 `_videoSize` 在抖音这种
+    // 边下边播的流上**每次都会超时**——日志里每条视频固定
+    // "open→视频参数就绪 2154ms" 就是 1.8s 白等。真正防花屏的门控已经
+    // 由 `_displayTextureId`（出帧后才发布）承担，尺寸晚到不会让用户
+    // 看到错尺寸采样，所以没必要同步等。
     final size = await _mdk.textureSize
-        .timeout(const Duration(milliseconds: 1800), onTimeout: () => null);
+        .timeout(const Duration(milliseconds: 450), onTimeout: () => null);
     if (size != null) {
-      _videoSize = size;
+      _videoSizeNotifier.value = size;
       // 每条视频重建纹理：libmdk 会先释放旧的，不会像 mpv 那样累积内存。
       try {
         await _mdk.updateTexture().timeout(
@@ -400,21 +482,34 @@ class Player {
       }
     } else {
       // 尺寸还没到：不阻塞 open。
-      // `textureId` 是 ValueNotifier，`Video` 监听它；后台补齐尺寸并建好
-      // 纹理后，界面会自动重绘，不需要播放页额外刷新。
+      // 后台补齐尺寸并建好纹理，再由 `_displayTextureId` 在真正出帧后
+      // 交给界面——`Video` 监听它，会自动重绘，不需要播放页额外刷新。
       unawaited(_mdk.textureSize.then((s) async {
         // 期间用户可能已经切到别的视频：世代不匹配就直接放弃，
         // 否则会把旧媒体的纹理建到新媒体的会话上。
         if (_disposed || s == null || seq != _openSeq) return;
-        _videoSize = s;
+        _videoSizeNotifier.value = s;
         try {
-          await _mdk.updateTexture();
+          await _mdk.updateTexture().timeout(
+              const Duration(milliseconds: 2500),
+              onTimeout: () => _timeoutCode);
         } catch (_) {
           // 同上：失败就留黑底。
         }
       }));
     }
     if (play) await this.play();
+    // 兜底：2.5 秒内一定把纹理交给界面。
+    // 正常路径是 position>0 就发布；只有"打开即暂停在 0 点"这类场景
+    // position 永远不推进，没有兜底就会一直黑屏。
+    _publishDeadline?.cancel();
+    _publishDeadline = Timer(const Duration(milliseconds: 2500), () {
+      if (_disposed || seq != _openSeq) return;
+      final id = _mdk.textureId.value;
+      if (id == null || id < 0) return;
+      if (_displayTextureId.value == id) return;
+      _displayTextureId.value = id;
+    });
   }
 
   Future<void> play() async {
@@ -456,6 +551,8 @@ class Player {
     if (_disposed) return;
     _disposed = true;
     _positionTimer?.cancel();
+    _publishDeadline?.cancel();
+    _publishDeadline = null;
     for (final s in _subscriptions) {
       // ignore: discarded_futures
       s.cancel();
@@ -473,6 +570,8 @@ class Player {
       // ignore: discarded_futures
       c.close();
     }
+    _displayTextureId.dispose();
+    _videoSizeNotifier.dispose();
   }
 }
 
@@ -501,9 +600,13 @@ class Video extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<int?>(
-      valueListenable: controller.id,
-      builder: (context, textureId, _) {
+    // 同时监听"纹理 id"和"视频尺寸"：尺寸可能在 open() 返回之后才补上，
+    // 只盯 textureId 的话会出现"id 有了、size 还是 null → 一直黑底"。
+    return ListenableBuilder(
+      listenable: Listenable.merge(
+          [controller.id, controller.player._videoSizeNotifier]),
+      builder: (context, _) {
+        final textureId = controller.id.value;
         final size = controller.player.videoSize;
         if (textureId == null || textureId < 0 || size == null) {
           return Container(color: fill);
