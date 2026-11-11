@@ -1,4 +1,4 @@
-import 'dart:io' show File, Platform;
+import 'dart:io' show Directory, File, Platform;
 
 import 'platform_style.dart';
 
@@ -242,6 +242,120 @@ class PlatformAdapter {
         'DejaVu Sans Mono',
         'Noto Sans Mono',
       ];
+
+  // -------------------------------------------------------------- 目录布局
+
+  /// 应用数据目录（放 Cookie、浏览器 profile 等需要持久化的文件）。
+  ///
+  /// 各平台遵循系统惯例：
+  /// - Windows：`%APPDATA%\douyin_desktop`
+  /// - macOS：`~/Library/Application Support/douyin_desktop`
+  /// - Linux：`$XDG_CONFIG_HOME/douyin_desktop`（默认 `~/.config/...`）
+  ///
+  /// 返回 null 表示环境变量缺失，调用方应降级到临时目录。
+  static String? get appDataDir {
+    final env = Platform.environment;
+    final sep = Platform.pathSeparator;
+    if (Platform.isWindows) {
+      final base = env['APPDATA'] ?? env['LOCALAPPDATA'] ?? env['USERPROFILE'];
+      return (base == null || base.isEmpty)
+          ? null
+          : '$base${sep}douyin_desktop';
+    }
+    final home = env['HOME'];
+    if (home == null || home.isEmpty) return null;
+    if (Platform.isMacOS) {
+      return '$home/Library/Application Support/douyin_desktop';
+    }
+    final xdg = env['XDG_CONFIG_HOME'];
+    final base = (xdg == null || xdg.isEmpty) ? '$home/.config' : xdg;
+    return '$base${sep}douyin_desktop';
+  }
+
+  /// 视频预缓存目录。
+  ///
+  /// 用「缓存」而非「配置」目录：这些 mp4 随时可以删，系统清理缓存时
+  /// 丢掉也不会影响功能。Linux 上如果误用配置目录，会在 `~/.config` 下
+  /// 堆几个 GB 的视频。
+  ///
+  /// - Windows：`%LOCALAPPDATA%\DouyinDesktopFlutter\video_cache`
+  /// - macOS：`~/Library/Caches/DouyinDesktopFlutter/video_cache`
+  /// - Linux：`$XDG_CACHE_HOME/DouyinDesktopFlutter/video_cache`
+  ///   （默认 `~/.cache/...`）
+  static String get videoCacheDir {
+    final env = Platform.environment;
+    final sep = Platform.pathSeparator;
+    if (Platform.isWindows) {
+      final local = env['LOCALAPPDATA'];
+      if (local != null && local.isNotEmpty) {
+        return '$local${sep}DouyinDesktopFlutter${sep}video_cache';
+      }
+    }
+    final home = env['HOME'];
+    if (home != null && home.isNotEmpty) {
+      if (Platform.isMacOS) {
+        return '$home/Library/Caches/DouyinDesktopFlutter/video_cache';
+      }
+      final xdg = env['XDG_CACHE_HOME'];
+      final base = (xdg == null || xdg.isEmpty) ? '$home/.cache' : xdg;
+      return '$base${sep}DouyinDesktopFlutter${sep}video_cache';
+    }
+    return '${Directory.systemTemp.path}${sep}douyin_video_cache';
+  }
+
+  // ------------------------------------------------------------ 平台能力
+
+  /// 是否需要关闭 mpv 的磁盘缓存。
+  ///
+  /// macOS 沙盒里 media_kit 默认的 `cache-on-disk` 路径不可写，mpv 会
+  /// 每帧重试并刷错误日志；Linux / Windows 没有这个问题，保持开启。
+  static bool get mustDisableMpvDiskCache => Platform.isMacOS;
+
+  /// media_kit 的视频纹理是否走硬件加速路径（`TextureHW`）。
+  ///
+  /// **macOS 必须默认关闭。** `TextureHW` 会创建一个独立的
+  /// `CGLContextObj` + `CVOpenGLTextureCache`，并在每帧渲染前后调用
+  /// `CGLSetCurrentContext(context)` / `CGLSetCurrentContext(nil)`。
+  /// Flutter 引擎自己的文字字形图集（glyph atlas）同样是 GL 纹理，
+  /// 两者共享 GPU 状态时，在 Intel 核显（UHD 620 一类）上会互相污染：
+  ///   - 视频画面周期性闪屏 / 错帧；
+  ///   - 评论区、顶栏这些**与视频无关**的纯 Flutter 文字碎裂成散乱字形，
+  ///     严重时整张文字图集被错误贴到视频区域，形成斜向碎片带。
+  /// 上游 `TextureHW.deinit` 自己也注明销毁 CGL 上下文"可能造成
+  /// RAM / VRAM 泄漏"，切换视频时反复创建销毁会进一步放大该问题。
+  ///
+  /// 关掉后走 `TextureSW`（mpv SW render API → CVPixelBuffer →
+  /// 由 Flutter 引擎自己上传），全程不碰 GL 状态。
+  /// **mpv 的 `hwdec=videotoolbox` 硬解仍然保留**：这里切换的是
+  /// "解码后的帧怎么交给 Flutter"，不是"用不用 GPU 解码"。
+  ///
+  /// 需要对比验证时可用 `DOUYIN_RENDER_HW=1` 强制开回硬件纹理路径。
+  static bool get defaultRenderHardwareAcceleration {
+    if (Platform.isMacOS) {
+      return Platform.environment['DOUYIN_RENDER_HW'] == '1';
+    }
+    return true;
+  }
+
+  /// 是否必须避免 `RenderRepaintBoundary.toImage()` 这类**整屏 GPU 回读**。
+  ///
+  /// macOS 上 `toImage()` 会把外部视频纹理（TextureHW 是 CVOpenGLTexture，
+  /// 属于 mpv 自建的 CGL 上下文）连同全屏文字一起重绘进 Skia 的离屏
+  /// 渲染目标，属于跨 GL 上下文采样，结果未定义；同时每次回读都会打断
+  /// 渲染管线。播放页原来在首帧后的 2.5 秒内每 140ms 抓一次全屏
+  /// （最多 18 次），切视频时还会再抓一次旧画面，正好落在闪屏的时间窗口。
+  ///
+  /// 关掉后首帧可见性改用固定延时放行（mpv 已在出帧，剩下的只是
+  /// 纹理上传延迟），切换动画退化为「仅新画面滑入」。
+  static bool get mustAvoidGpuReadback => Platform.isMacOS;
+
+  /// 用系统默认程序打开 URL 的命令行（[exe] 与 [args]）。
+  static (String, List<String>) openUrlCommand(String url) =>
+      switch (desktopFlavor) {
+        DesktopFlavor.windows => ('cmd', ['/c', 'start', '', url]),
+        DesktopFlavor.macOS => ('open', [url]),
+        DesktopFlavor.linux => ('xdg-open', [url]),
+      };
 
   // ------------------------------------------------------------------ 窗口
 

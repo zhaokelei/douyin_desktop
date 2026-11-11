@@ -15,6 +15,7 @@ class DebugOverlay extends StatelessWidget {
     required this.onToggleHardware,
     this.softwareFallback = false,
     this.cacheLine = '',
+    this.renderBackend = '',
   });
 
   final String hwdecCurrent;
@@ -30,6 +31,10 @@ class DebugOverlay extends StatelessWidget {
 
   /// 视频缓存状态（内存占用 / 磁盘 / 未启用），空字符串表示不显示。
   final String cacheLine;
+
+  /// 视频帧交给 Flutter 的渲染后端。硬件纹理（OpenGL）在 macOS 上会与
+  /// 字形图集抢 GL 状态，显示出来便于确认当前是否走在稳定路径上。
+  final String renderBackend;
 
   bool get _hardwareActive {
     final v = hwdecCurrent.toLowerCase();
@@ -94,6 +99,7 @@ class DebugOverlay extends StatelessWidget {
           _row('分辨率', resolution),
           _row('帧率', frameRate),
           if (cacheLine.isNotEmpty) _row('视频缓存', cacheLine),
+          if (renderBackend.isNotEmpty) _row('视频纹理', renderBackend),
           const SizedBox(height: 8),
           const Divider(height: 1),
           const SizedBox(height: 8),

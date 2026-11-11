@@ -31,16 +31,36 @@ class AppTheme {
       DesktopFlavor.linux => 'Noto Sans CJK SC',
     };
 
+    // 每端只列该系统**真实存在**的字体族。原来三端共用一份 fallback，
+    // macOS 上每渲染一批文字都要先跳过 Microsoft YaHei UI / Segoe UI
+    // 这两个不存在的字体族；在字形图集（glyph atlas）压力较大、
+    // 或 GPU 纹理资源紧张时会放大成字体解析抖动。
+    final fontFamilyFallback = switch (flavor) {
+      DesktopFlavor.windows => const [
+          'Microsoft YaHei UI',
+          'Microsoft YaHei',
+          'Segoe UI',
+          'Arial',
+        ],
+      DesktopFlavor.macOS => const [
+          'PingFang SC',
+          'Heiti SC',
+          'Apple LiGothic',
+          'Helvetica',
+        ],
+      DesktopFlavor.linux => const [
+          'Noto Sans CJK SC',
+          'Source Han Sans SC',
+          'WenQuanYi Micro Hei',
+          'DejaVu Sans',
+        ],
+    };
+
     final textTheme = Typography.material2021(colorScheme: scheme)
         .white
         .apply(
           fontFamily: fontFamily,
-          fontFamilyFallback: const [
-            'Microsoft YaHei UI',
-            'PingFang SC',
-            'Noto Sans CJK SC',
-            'Segoe UI',
-          ],
+          fontFamilyFallback: fontFamilyFallback,
           bodyColor: const Color(0xFFEDEDED),
           displayColor: const Color(0xFFF7F7F7),
         );

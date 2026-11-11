@@ -107,9 +107,13 @@ class _PlayerPageState extends State<PlayerPage>
   /// 降级流程正在执行（防重入）。
   bool _hwFallbackInProgress = false;
 
-  /// media_kit 渲染层是否走硬件加速。一级降级只关 mpv 的 hwdec，
+  /// media_kit 渲染层是否走硬件加速（`TextureHW`）。一级降级只关 mpv 的 hwdec，
   /// 二级降级（软解仍然黑屏）会连渲染层加速一起关掉再重建播放器。
-  bool _renderHwAccel = true;
+  ///
+  /// macOS 默认 false：TextureHW 的独立 CGL 上下文会污染 Flutter 的字形图集，
+  /// 表现为播放闪屏 + 全界面文字碎裂。详见
+  /// [PlatformAdapter.defaultRenderHardwareAcceleration]。
+  bool _renderHwAccel = PlatformAdapter.defaultRenderHardwareAcceleration;
 
   bool _playing = false;
   bool _muted = false;
@@ -288,6 +292,33 @@ class _PlayerPageState extends State<PlayerPage>
   Timer? _hideTimer;
   Timer? _propertyTimer;
 
+  /// 控制条的局部刷新信号。
+  ///
+  /// 播放中位置每秒更新数次、时长/播放状态也会变，但**只有底部控制条**
+  /// 依赖这些值。用独立的 Listenable 驱动那一小块子树，避免整页
+  /// （视频纹理层、封面、信息区、右侧互动栏）跟着重建。
+  final _UiTick _uiTick = _UiTick();
+  bool _uiTickScheduled = false;
+
+  /// 合并同一帧内的多次刷新请求：一次 notify 就够，避免重复标脏。
+  ///
+  /// 控制条不可见时直接跳过：鼠标静止 3 秒后它会淡出，此时播放位置
+  /// 每 150ms 的变化没有任何像素需要更新。跳过重建后，播放稳定期
+  /// Flutter 侧完全不再提交 UI 绘制，GPU 只负责视频纹理的合成。
+  ///
+  /// 注意：可见性本身的变化不走这里，它由 [_resetHideTimer] 的 setState 处理。
+  void _bumpControlUi() {
+    if (!mounted || _uiTickScheduled) return;
+    if (_uiHidden || !_controlsVisible) return;
+    _uiTickScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _uiTickScheduled = false;
+      if (mounted) _uiTick.ping();
+    });
+    // 立即请求一帧：否则纯 notify 不会自动调度新的绘制。
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
   String _hwdecCurrent = '—';
   String _codec = '—';
   String _resolution = '—';
@@ -402,13 +433,22 @@ class _PlayerPageState extends State<PlayerPage>
       // 不传时原生按视频本身的 dw/dh 出纹理，Flutter 侧 `Video` 的
       // FittedBox(BoxFit.contain) 负责缩放到窗口，天然自适应、无黑块，
       // 且**窗口怎么缩放都不需要重建播放器**。
-      // enableHardwareAcceleration 是渲染层（纹理/GPU 拷贝）的开关，
-      // 与 mpv 的 hwdec 不是一回事：某些机器解码能软解、但纹理硬件加速失败，
-      // 表现为黑屏+报错，二级降级就靠关掉它来恢复画面。
+      // enableHardwareAcceleration 是**渲染层**（解码后的帧怎么交给 Flutter）
+      // 的开关，与 mpv 的 hwdec（用不用 GPU 解码）是两回事：
+      //   - true  → macOS 走 TextureHW：独立 CGL/OpenGL 上下文 +
+      //     CVOpenGLTextureCache。它会与 Flutter 的字形图集纹理抢 GL 状态，
+      //     在 Intel 核显上实测会「播放闪屏 + 评论区/顶栏文字碎裂」；
+      //   - false → 走 TextureSW：mpv SW render API → CVPixelBuffer →
+      //     由 Flutter 引擎自己上传，全程不碰 GL 状态。硬解依然保留。
+      // macOS 默认 false（见 PlatformAdapter.defaultRenderHardwareAcceleration），
+      // 二级降级也会把它从 true 关到 false 再重建播放器。
       configuration: VideoControllerConfiguration(
         enableHardwareAcceleration: _renderHwAccel,
       ),
     );
+    diag('render',
+        '视频纹理后端=${_renderHwAccel ? "TextureHW(OpenGL)" : "TextureSW(CVPixelBuffer)"} '
+        'hwdec=${_hardware ? PlatformAdapter.preferredHwdec : "no"}');
     _mpvConfigured = false;
     // 换播放器实例后解码器会重建，软解标记先复位，等首帧后再判定。
     _hwSoftwareFallback = false;
@@ -478,19 +518,25 @@ class _PlayerPageState extends State<PlayerPage>
     _subscriptions.add(_player.stream.position.listen((p) {
       if (!mounted) return;
       // 性能要点（i5-8250U / UHD 620）：position 回调频率跟着 mpv 的属性
-      // 刷新走，一秒可能十几次。每次都 setState 等于整棵播放页重建十几次，
-      // 而这些重建里唯一要变的只是控制条上的时间文字与进度条。
-      // 这里把 UI 刷新节流到 ~150ms（肉眼仍然连续），但 _position 本身
-      // 始终更新为最新值，seek / 缓存补跳等逻辑读到的都是准确位置。
+      // 刷新走，一秒可能十几次。原先每次 setState 都会重建整棵播放页
+      // （视频层 + 顶栏 + 信息区 + 侧栏 + 控制条），而这些重建里唯一要变的
+      // 只是控制条上的时间文字与进度条。
+      //
+      // 现在分两层处理：
+      //   1. UI 刷新节流到 ~150ms（肉眼仍然连续）；
+      //   2. 刷新只通知控制条那一个子树（[_uiTick]），外层 build 不重跑，
+      //      视频纹理层、封面、侧栏全部原样复用。
+      // _position 本身始终更新为最新值，seek / 缓存补跳等逻辑读到的是准确位置。
       _position = p;
       final delta = (p - _lastUiPosition).inMilliseconds.abs();
       if (delta < 150) return;
       _lastUiPosition = p;
-      setState(() {});
+      _bumpControlUi();
     }));
     _subscriptions.add(_player.stream.duration.listen((d) {
       if (!mounted) return;
-      setState(() => _duration = d);
+      _duration = d;
+      _bumpControlUi();
     }));
     // 自动清晰度：持续缓冲说明当前档位吃紧，稳定 1.5s 后降一档。
     _subscriptions.add(_player.stream.buffering.listen((b) {
@@ -508,7 +554,8 @@ class _PlayerPageState extends State<PlayerPage>
 
     _subscriptions.add(_player.stream.playing.listen((p) {
       if (!mounted) return;
-      setState(() => _playing = p);
+      _playing = p;
+      _bumpControlUi();
       // 注意：这里**不能**恢复音量。media_kit 的 playing 事件只代表 pause
       // 被置为 false，此时视频首帧往往还没解码/提交到纹理，提前恢复音量
       // 就是"黑屏先出声"的直接原因。首帧判定统一交给
@@ -773,7 +820,12 @@ class _PlayerPageState extends State<PlayerPage>
 
   void _resetHideTimer() {
     _hideTimer?.cancel();
-    if (!_controlsVisible && mounted) setState(() => _controlsVisible = true);
+    // 可见性变化要重绘外层：AnimatedOpacity 的透明度依赖 _controlsVisible，
+    // 只有 setState 才能让它重建。这个事件频率很低（每次 3 秒一次），
+    // 不属于需要局部化的高频刷新。
+    if (!_controlsVisible && mounted) {
+      setState(() => _controlsVisible = true);
+    }
     if (_forceControls) return;
     _hideTimer = Timer(const Duration(seconds: 3), () {
       if (!mounted) return;
@@ -838,7 +890,7 @@ class _PlayerPageState extends State<PlayerPage>
         diag('mpv', '关闭 osc/osd 失败: $e');
       }
       // macOS 沙盒内 disk cache 必然失败：直接关掉，别再让它反复重试。
-      if (Platform.isMacOS) {
+      if (PlatformAdapter.mustDisableMpvDiskCache) {
         try {
           await platform.setProperty('cache-on-disk', 'no');
         } catch (e) {
@@ -1130,11 +1182,15 @@ class _PlayerPageState extends State<PlayerPage>
             diag('hwdec', '一级降级设置 hwdec=no 失败：$e');
           }
         }
-      } else {
+      } else if (_renderHwAccel) {
         _renderHwAccel = false;
         if (mounted) setState(() => _playError = null);
         // 换渲染方式必须重建播放器与视频输出，光改属性不生效。
         await _recyclePlayer();
+      } else {
+        // macOS 默认就是 TextureSW，渲染层已无可降级。
+        // 不要白重建一次播放器（会黑屏几百毫秒），直接把结果交给提示。
+        diag('hwdec', '渲染层已是软件纹理路径，二级降级无级可降');
       }
       // 等当前 open 流程退出，避免两个 open 并发把 mpv 打到中间状态。
       for (var i = 0; i < 60 && _switching; i++) {
@@ -1193,9 +1249,13 @@ class _PlayerPageState extends State<PlayerPage>
         _hwFallbackNotified = false;
       }
     });
-    if (_hardware && !_renderHwAccel) {
+    // 用户主动开回硬解：把渲染层恢复到**本平台的默认值**。
+    // 不能无脑写 true——macOS 默认就该是软件纹理路径，写回 true 会
+    // 让切换一次设置就把「闪屏 + 文字碎裂」重新引回来。
+    final defaultRenderHw = PlatformAdapter.defaultRenderHardwareAcceleration;
+    if (_hardware && _renderHwAccel != defaultRenderHw) {
       // 上次降到了软件渲染，现在用户要求硬解，必须重建播放器才能恢复。
-      _renderHwAccel = true;
+      _renderHwAccel = defaultRenderHw;
       await _recyclePlayer();
     }
     final platform = _player.platform;
@@ -1897,24 +1957,55 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 轮询真实渲染亮度：连续两次确认"视频主区不再是黑色"后才恢复音量。
   /// 上限 2.5s；始终测不到（极少数 GPU 截不到纹理）时按超时放行并如实记录。
+  ///
+  /// 性能：`toImage` 是 GPU → CPU 的整块回读，在核显上单次就要几毫秒，
+  /// 期间还会打断渲染管线。原来每 70ms 抓一次、连抓 2.5 秒 ≈ 35 次。
+  /// 现在：
+  ///   * 间隔放宽到 140ms（首帧确认本来就允许 2.5s，肉眼看不出差别）；
+  ///   * 采样比例 0.08 → 0.06，回读的像素量再降一档；
+  ///   * 连续两次返回"纯黑/拿不到"就直接判定为黑屏，不再继续空转。
   Future<void> _unmuteWhenVisible(int gen) async {
+    // macOS：跳过整屏 GPU 回读。
+    //
+    // `toImage()` 会把外部视频纹理连同全屏文字重绘进离屏 surface，
+    // 在 Intel 核显上会与 mpv 的 CGL 上下文串扰、污染字形图集，
+    // 实测表现为「播放闪屏 + 评论区/顶栏文字碎裂」，严重时整张文字
+    // 图集被错误贴到视频区域（斜向碎片带）。详见
+    // [PlatformAdapter.mustAvoidGpuReadback]。
+    //
+    // 能走到这里说明 mpv 已经在出帧（_revealFirstFrame 的前提），
+    // 剩下的只是共享纹理上传到 Flutter 的百毫秒级延迟，固定延时即可，
+    // 不需要为了"确认画面亮不亮"反复抓全屏。
+    if (PlatformAdapter.mustAvoidGpuReadback) {
+      await Future<void>.delayed(const Duration(milliseconds: 320));
+      if (!mounted || gen != _openGeneration) return;
+      diag('avsync',
+          'macOS 跳过整屏 GPU 回读，按纹理上传延时放行${_forceMute ? "（保持静音）" : "出声"}（gen=$gen）');
+      _unmuteAfterFirstFrame();
+      return;
+    }
     final deadline = DateTime.now().add(const Duration(milliseconds: 2500));
     var hits = 0;
+    var dark = 0;
     var last = -1.0;
     while (DateTime.now().isBefore(deadline)) {
       if (!mounted || gen != _openGeneration) return;
-      final brightness = await sampleScreenBrightness(pixelRatio: 0.08);
+      final brightness = await sampleScreenBrightness(pixelRatio: 0.06);
       last = brightness;
       if (_avTrace) {
         diag('avtrace', '屏幕亮度=${brightness.toStringAsFixed(1)} 连续命中=$hits');
       }
       if (brightness >= 12) {
         hits++;
+        dark = 0;
         if (hits >= 2) break;
       } else {
         hits = 0;
+        // 黑屏时画面确实是黑的，连续两次就没必要再抓了，直接按超时放行，
+        // 把后面两秒的 GPU 回读省掉。
+        if (brightness >= 0 && ++dark >= 2) break;
       }
-      await Future<void>.delayed(const Duration(milliseconds: 70));
+      await Future<void>.delayed(const Duration(milliseconds: 140));
     }
     if (!mounted || gen != _openGeneration) return;
     if (last >= 12) {
@@ -2002,12 +2093,23 @@ class _PlayerPageState extends State<PlayerPage>
     // 自测开关：DOUYIN_LEAN=1 关掉"旧画面快照"和封面模糊，用来隔离
     // 抓图/封面在内存剖面里的占比。
     if (Platform.environment['DOUYIN_LEAN'] == '1') return;
+    // macOS 上不抓旧画面：这张快照同样通过 toImage() 把外部视频纹理
+    // 重绘进离屏 surface，是闪屏 / 文字碎裂的诱因之一。
+    // 不抓时 _outgoingFrame 保持 null，渲染树本就不会构建滑出层，
+    // 动画自然退化为「仅新画面滑入」，不影响切换功能。
+    if (PlatformAdapter.mustAvoidGpuReadback) {
+      diag('anim', 'macOS 跳过旧画面快照（避免整屏 GPU 回读）');
+      return;
+    }
     final boundary =
         _videoBoundaryKey.currentContext?.findRenderObject()
             as RenderRepaintBoundary?;
     if (boundary == null) return;
     try {
-      final image = await boundary.toImage(pixelRatio: 0.7);
+      // 0.5 而不是 0.7：这张快照只用于"旧画面滑出 + 淡出"的 260ms 动画，
+      // 期间还会被 Opacity 压暗到 0.92 以下并快速移出视野，分辨率再高
+      // 也看不出来。像素量降一半，GPU→CPU 回读与随后的纹理上传都更便宜。
+      final image = await boundary.toImage(pixelRatio: 0.5);
       _outgoingFrame?.dispose();
       _outgoingFrame = image;
       diag('anim', '旧画面快照 ${image.width}x${image.height}');
@@ -2327,8 +2429,10 @@ class _PlayerPageState extends State<PlayerPage>
         _hwFallbackNotified = false;
       }
     });
-    if (_hardware && !_renderHwAccel) {
-      _renderHwAccel = true;
+    // 同上：恢复的是本平台默认值，不是无脑 true。
+    final defaultRenderHw = PlatformAdapter.defaultRenderHardwareAcceleration;
+    if (_hardware && _renderHwAccel != defaultRenderHw) {
+      _renderHwAccel = defaultRenderHw;
       await _recyclePlayer();
     }
     final platform = _player.platform;
@@ -2462,14 +2566,8 @@ class _PlayerPageState extends State<PlayerPage>
 
   void _openInBrowser(String url) {
     try {
-      if (Platform.isWindows) {
-        unawaited(Process.start(
-            'cmd', ['/c', 'start', '', url], runInShell: true));
-      } else if (Platform.isMacOS) {
-        unawaited(Process.start('open', [url]));
-      } else {
-        unawaited(Process.start('xdg-open', [url]));
-      }
+      final (exe, args) = PlatformAdapter.openUrlCommand(url);
+      unawaited(Process.start(exe, args, runInShell: true));
     } catch (e) {
       _toast('打开浏览器失败：${ErrorText.from(e)}');
     }
@@ -2702,6 +2800,7 @@ class _PlayerPageState extends State<PlayerPage>
     _loadDeadlineTimer?.cancel();
     _bufferTimer?.cancel();
     _logFlushTimer?.cancel();
+    _uiTick.dispose();
     _slideCtrl.dispose();
     _bounceCtrl.dispose();
     _outgoingFrame?.dispose();
@@ -2724,12 +2823,61 @@ class _PlayerPageState extends State<PlayerPage>
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final item = _current;
+  /// 底部控制条。独立成方法，由 [_uiTick] 驱动单独重建。
+  ///
+  /// 播放期间只有这里依赖 [_position] / [_duration] / [_playing]，
+  /// 把它们关在这个子树里，外层播放页就不会跟着位置回调反复重建。
+  Widget _buildControlBar() {
     final totalMs = _duration.inMilliseconds;
     final posMs = _dragValue?.inMilliseconds ??
         _position.inMilliseconds.clamp(0, totalMs == 0 ? 1 << 30 : totalMs);
+    return _ControlBar(
+      positionMs: posMs.toDouble(),
+      durationMs: totalMs.toDouble(),
+      playing: _playing,
+      volume: _volume,
+      muted: _muted,
+      speed: _speed,
+      quality: _qualityLabel,
+      autoNext: _autoNext,
+      danmakuOn: _danmakuOn,
+      onSeekStart: (v) => setState(() =>
+          _dragValue = Duration(milliseconds: v.round())),
+      onSeekChanged: (v) => setState(() =>
+          _dragValue = Duration(milliseconds: v.round())),
+      onSeekEnd: (v) {
+        _seekTo(Duration(milliseconds: v.round()));
+        setState(() => _dragValue = null);
+        _resetHideTimer();
+      },
+      onTogglePlay: _togglePlay,
+      onVolumeChanged: _setVolume,
+      onToggleMute: _toggleMute,
+      onCycleSpeed: _cycleSpeed,
+      onToggleAutoNext: () => setState(() => _autoNext = !_autoNext),
+      onToggleDanmaku: () {
+        setState(() => _danmakuOn = !_danmakuOn);
+        if (_danmakuOn) {
+          _toast('弹幕数据接口本期未接入，开关状态已记录');
+        }
+      },
+      onClearScreen: () => setState(() => _uiHidden = true),
+      onToggleFullscreen: _toggleFullscreen,
+      fullscreen: _fullscreen,
+      onOpenComments: _toggleComments,
+      onSend: () => setState(() {
+        _commentTab = kDrawerTabComments;
+        _showComments = true;
+      }),
+      onQuality: _showQualityPicker,
+      onPip: () => _toast('桌面端暂不支持画中画'),
+      onSettings: () => _toggleDebug(),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final item = _current;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0B0B0B),
@@ -3039,11 +3187,19 @@ class _PlayerPageState extends State<PlayerPage>
                               hardwareEnabled: _hardware,
                               softwareFallback: _hwSoftwareFallback,
                               cacheLine: _cacheStatusLine(),
+                              renderBackend: _renderHwAccel
+                                  ? '硬件纹理（OpenGL）'
+                                  : '软件纹理（稳定）',
                               logs: _logs,
                               onToggleHardware: _toggleHardware,
                             ),
                           ),
                         // 底部控制条
+                        //
+                        // 整个控制条包在一个 ListenableBuilder 里：播放位置、
+                        // 时长、播放/暂停这些高频变化的量只让这一小块重建，
+                        // 外层播放页（视频纹理层、封面、信息区、互动栏）
+                        // 在播放期间保持原样，不再每秒重建数次。
                         Positioned(
                           left: 0,
                           right: 0,
@@ -3053,49 +3209,9 @@ class _PlayerPageState extends State<PlayerPage>
                             duration: const Duration(milliseconds: 260),
                             child: IgnorePointer(
                               ignoring: _uiHidden || !_controlsVisible,
-                              child: _ControlBar(
-                                positionMs: posMs.toDouble(),
-                                durationMs: totalMs.toDouble(),
-                                playing: _playing,
-                                volume: _volume,
-                                muted: _muted,
-                                speed: _speed,
-                                quality: _qualityLabel,
-                                autoNext: _autoNext,
-                                danmakuOn: _danmakuOn,
-                                onSeekStart: (v) => setState(() => _dragValue =
-                                    Duration(milliseconds: v.round())),
-                                onSeekChanged: (v) => setState(() => _dragValue =
-                                    Duration(milliseconds: v.round())),
-                                onSeekEnd: (v) {
-                                  _seekTo(Duration(milliseconds: v.round()));
-                                  setState(() => _dragValue = null);
-                                  _resetHideTimer();
-                                },
-                                onTogglePlay: _togglePlay,
-                                onVolumeChanged: _setVolume,
-                                onToggleMute: _toggleMute,
-                                onCycleSpeed: _cycleSpeed,
-                                onToggleAutoNext: () =>
-                                    setState(() => _autoNext = !_autoNext),
-                                onToggleDanmaku: () {
-                                  setState(() => _danmakuOn = !_danmakuOn);
-                                  if (_danmakuOn) {
-                                    _toast('弹幕数据接口本期未接入，开关状态已记录');
-                                  }
-                                },
-                                onClearScreen: () =>
-                                    setState(() => _uiHidden = true),
-                                onToggleFullscreen: _toggleFullscreen,
-                                fullscreen: _fullscreen,
-                                onOpenComments: _toggleComments,
-                                onSend: () => setState(() {
-                                      _commentTab = kDrawerTabComments;
-                                      _showComments = true;
-                                    }),
-                                onQuality: _showQualityPicker,
-                                onPip: () => _toast('桌面端暂不支持画中画'),
-                                onSettings: () => _toggleDebug(),
+                              child: ListenableBuilder(
+                                listenable: _uiTick,
+                                builder: (context, _) => _buildControlBar(),
                               ),
                             ),
                           ),
@@ -3300,6 +3416,11 @@ class _PlayerPageState extends State<PlayerPage>
 }
 
 // ---------------- 子组件 ----------------
+
+class _UiTick extends ChangeNotifier {
+  /// 把 protected 的 [notifyListeners] 暴露给持有者，用于局部刷新控制条。
+  void ping() => notifyListeners();
+}
 
 class _ShortcutRow extends StatelessWidget {
   const _ShortcutRow(this.keyLabel, this.desc);
@@ -3760,6 +3881,13 @@ class _RoundIconButton extends StatelessWidget {
 
 /// 首帧到达前的封面模糊占位：既不是纯黑，也不会因为原图过大而占内存
 /// （[CachedNetworkImage.memCacheWidth] 限制解码宽度）。
+///
+/// 性能要点：`ImageFiltered` 的高斯模糊**每帧都要重新算**，占满整块播放区时
+/// 在核显上是实打实的填充率开销。这里做两件事：
+///   1. 外面套一层 [RepaintBoundary]：封面是静态的，模糊结果可以缓存成一层
+///      位图，后续帧只做合成，不再重跑模糊；
+///   2. sigma 从 16 降到 8：占位图本来就被压暗 40%，视觉差异可以忽略，
+///      但模糊核的采样量随 sigma 显著下降。
 class _CoverBlur extends StatelessWidget {
   const _CoverBlur({required this.url});
 
@@ -3770,19 +3898,21 @@ class _CoverBlur extends StatelessWidget {
     if (url.isEmpty || Platform.environment['DOUYIN_LEAN'] == '1') {
       return const ColoredBox(color: Color(0xFF141414));
     }
-    return ClipRect(
-      child: ImageFiltered(
-        imageFilter: ui.ImageFilter.blur(sigmaX: 16, sigmaY: 16),
-        child: ColorFiltered(
-          colorFilter:
-              const ColorFilter.mode(Color(0x66000000), BlendMode.darken),
-          child: CachedNetworkImage(
-            imageUrl: url,
-            fit: BoxFit.cover,
-            memCacheWidth: 480,
-            fadeInDuration: const Duration(milliseconds: 120),
-            placeholder: (_, _) => const ColoredBox(color: Color(0xFF1A1A1A)),
-            errorWidget: (_, _, _) => const ColoredBox(color: Color(0xFF141414)),
+    return RepaintBoundary(
+      child: ClipRect(
+        child: ImageFiltered(
+          imageFilter: ui.ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+          child: ColorFiltered(
+            colorFilter:
+                const ColorFilter.mode(Color(0x66000000), BlendMode.darken),
+            child: CachedNetworkImage(
+              imageUrl: url,
+              fit: BoxFit.cover,
+              memCacheWidth: 480,
+              fadeInDuration: const Duration(milliseconds: 120),
+              placeholder: (_, _) => const ColoredBox(color: Color(0xFF1A1A1A)),
+              errorWidget: (_, _, _) => const ColoredBox(color: Color(0xFF141414)),
+            ),
           ),
         ),
       ),
