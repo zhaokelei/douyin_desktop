@@ -81,19 +81,10 @@ class VideoCache {
     // 自测钩子：把缓存目录指到临时目录，不污染用户真实缓存。
     final override = Platform.environment['DOUYIN_CACHE_DIR'];
     if (override != null && override.isNotEmpty) return override;
-    final local = Platform.environment['LOCALAPPDATA'];
-    final sep = Platform.pathSeparator;
-    if (local != null && local.isNotEmpty) {
-      return '$local${sep}DouyinDesktopFlutter${sep}video_cache';
-    }
-    // macOS：沙盒下 $HOME 指向应用容器，Application Support 可持久写入；
-    // 不能用系统临时目录——会被系统定期清空，缓存等于白下。
-    final home = Platform.environment['HOME'];
-    if (home != null && home.isNotEmpty) {
-      return '$home${sep}Library${sep}Application Support${sep}'
-          'DouyinDesktopFlutter${sep}video_cache';
-    }
-    return '${Directory.systemTemp.path}${sep}douyin_video_cache';
+    // 三端路径统一由 PlatformAdapter 决定：Linux 落在 $XDG_CACHE_HOME，
+    // macOS 落在 ~/Library/Caches，Windows 落在 %LOCALAPPDATA%。
+    // 不能统一用系统临时目录——会被系统定期清空，缓存等于白下。
+    return PlatformAdapter.videoCacheDir;
   }
 
   static String keyOf(String awemeId, int height) => '${awemeId}_$height';

@@ -24,6 +24,13 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Timer? _ticker;
 
+  /// 「运行状态」卡片的局部刷新信号。
+  ///
+  /// 内存/缓存占用每秒变一次，但整页只有那一张卡片依赖它。用独立
+  /// Listenable 驱动该卡片，避免设置页整体（含所有选项与说明文字）
+  /// 每秒重建一次——页面上那几个开关的布局完全没变，纯属白付。
+  final _UsageTick _usageTick = _UsageTick();
+
   @override
   void initState() {
     super.initState();
@@ -32,13 +39,14 @@ class _SettingsPageState extends State<SettingsPage> {
     unawaited(_cache.init());
     // 预取在播放页后台进行，占用会随时变化，1 秒刷一次足够。
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
+      if (mounted) _usageTick.ping();
     });
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _usageTick.dispose();
     _settings.removeListener(_onChanged);
     super.dispose();
   }
@@ -196,23 +204,31 @@ class _SettingsPageState extends State<SettingsPage> {
             title: '运行状态',
             icon: Icons.monitor_heart_outlined,
             children: [
-              _InfoRow(
-                label: '进程内存',
-                value:
-                    '${(ProcessInfo.currentRss / (1024 * 1024)).toStringAsFixed(0)} MB',
-              ),
-              _InfoRow(
-                label: '磁盘缓存',
-                value: _cache.ready
-                    ? '${(_cache.usedBytes / (1024 * 1024)).toStringAsFixed(1)} MB / '
-                        '${(_cache.maxBytes / (1024 * 1024)).toStringAsFixed(0)} MB'
-                        ' · ${_cache.itemCount} 条'
-                    : '正在读取…',
-              ),
-              _InfoRow(
-                label: '缓存命中',
-                value: '${_cache.hitCount} / ${_cache.missCount} 次'
-                    '（失败 ${_cache.failureCount}）',
+              ListenableBuilder(
+                listenable: _usageTick,
+                builder: (context, _) => Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _InfoRow(
+                      label: '进程内存',
+                      value:
+                          '${(ProcessInfo.currentRss / (1024 * 1024)).toStringAsFixed(0)} MB',
+                    ),
+                    _InfoRow(
+                      label: '磁盘缓存',
+                      value: _cache.ready
+                          ? '${(_cache.usedBytes / (1024 * 1024)).toStringAsFixed(1)} MB / '
+                              '${(_cache.maxBytes / (1024 * 1024)).toStringAsFixed(0)} MB'
+                              ' · ${_cache.itemCount} 条'
+                          : '正在读取…',
+                    ),
+                    _InfoRow(
+                      label: '缓存命中',
+                      value: '${_cache.hitCount} / ${_cache.missCount} 次'
+                          '（失败 ${_cache.failureCount}）',
+                    ),
+                  ],
+                ),
               ),
               const SizedBox(height: 6),
               _ActionButton(
@@ -249,6 +265,11 @@ class _SettingsPageState extends State<SettingsPage> {
       backgroundColor: const Color(0xEE2A2A2A),
     ));
   }
+}
+
+class _UsageTick extends ChangeNotifier {
+  /// 暴露 protected 的 [notifyListeners]，供「运行状态」卡片局部刷新。
+  void ping() => notifyListeners();
 }
 
 class _SectionCard extends StatelessWidget {

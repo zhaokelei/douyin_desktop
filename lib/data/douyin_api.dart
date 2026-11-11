@@ -261,24 +261,9 @@ class DouyinApi {
   }
 
   /// 稳定的用户数据目录（可写、不随构建产物被清理）。
-  static String? stableDataDir() {
-    final sep = Platform.pathSeparator;
-    if (Platform.isWindows) {
-      final appData = Platform.environment['APPDATA'];
-      if (appData != null && appData.isNotEmpty) {
-        return '$appData${sep}douyin_desktop';
-      }
-    }
-    final xdg = Platform.environment['XDG_CONFIG_HOME'];
-    if (xdg != null && xdg.isNotEmpty) return '$xdg${sep}douyin_desktop';
-    final home =
-        Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
-    if (home == null || home.isEmpty) return null;
-    if (Platform.isMacOS) {
-      return '$home${sep}Library${sep}Application Support${sep}douyin_desktop';
-    }
-    return '$home${sep}.config${sep}douyin_desktop';
-  }
+  ///
+  /// 具体路径由 [PlatformAdapter.appDataDir] 决定，三端各自遵循系统惯例。
+  static String? stableDataDir() => PlatformAdapter.appDataDir;
 
   /// 自己保存 Cookie 的首选路径（与 [cookieCandidatePaths] 的第一项一致）。
   static String? stableCookiePath() {

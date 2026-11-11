@@ -62,7 +62,10 @@ build\windows\x64\runner\Release\douyin_desktop.exe
 
 ### 硬解
 
-`PlatformAdapter.preferredHwdec` 在 Windows 返回 `d3d11va`（D3D11 硬解）。
+`PlatformAdapter.preferredHwdec` 在 Windows 返回 `auto-safe`（依次尝试
+d3d11va → nvdec → d3d11va-copy，最终至少落在 GPU 解码上）。不写死 `d3d11va`
+是因为零拷贝 d3d11va 在部分驱动 / 多显卡（含虚拟显示器）环境下会建不起
+D3D11 设备，随后静默回落软解。
 对比软解可加环境变量 `DOUYIN_HWDEC=no`，播放页调试层会显示
 `hwdec-current` 的实际值。
 
@@ -231,7 +234,11 @@ codesign -d --entitlements :- build/macos/Build/Products/Release/douyin_desktop.
 | `libmpvOverride` | `DOUYIN_LIBMPV` → `LIBMPV_LIBRARY_PATH` → null | 同左 | 同左 |
 | `userAgent` | Windows NT 10.0 | X11; Linux x86_64 | Macintosh Intel Mac OS X 10_15_7 |
 | `webFingerprint` | 2560×1440 / Windows / Win32 | 1920×1080 / Linux / `Linux x86_64` | 1920×1080 / Mac / MacIntel |
-| `preferredHwdec` | `d3d11va` | `auto-safe` | `videotoolbox` |
+| `preferredHwdec` | `auto-safe` | `auto-safe` | `videotoolbox` |
+| `mustDisableMpvDiskCache` | false | false | **true**（沙盒内 disk cache 不可写） |
+| `openUrlCommand` | `cmd /c start` | `xdg-open` | `open` |
+| `appDataDir` | `%APPDATA%\douyin_desktop` | `$XDG_CONFIG_HOME/douyin_desktop` | `~/Library/Application Support/douyin_desktop` |
+| `videoCacheDir` | `%LOCALAPPDATA%\DouyinDesktopFlutter\video_cache` | `$XDG_CACHE_HOME/DouyinDesktopFlutter/video_cache` | `~/Library/Caches/DouyinDesktopFlutter/video_cache` |
 | `monospaceFontFamily` | Consolas | DejaVu Sans Mono | Menlo |
 | 窗口默认 / 最小 | 1280×800 / 1020×640 | 同左 | 同左 |
 

@@ -30,10 +30,14 @@ Future<double> sampleScreenBrightness({double pixelRatio = 0.12}) async {
     final y0 = (h * 0.2).round();
     final y1 = (h * 0.8).round();
     final x1 = (w * 0.7).round();
+    // 逐像素求和是纯 Dart 循环，大图上并不便宜。这里按步长跳采：
+    // 判断"是不是黑屏"只需要一个粗略平均值，隔行隔列取 1/9 的像素
+    // 结果几乎一样，CPU 时间却少一个数量级。
+    const step = 3;
     var sum = 0.0;
     var count = 0;
-    for (var y = y0; y < y1; y++) {
-      for (var x = 2; x < x1; x++) {
+    for (var y = y0; y < y1; y += step) {
+      for (var x = 2; x < x1; x += step) {
         final i = (y * w + x) * 4;
         final r = data.getUint8(i);
         final g = data.getUint8(i + 1);

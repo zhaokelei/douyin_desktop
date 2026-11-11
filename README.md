@@ -150,6 +150,29 @@ tool/           自测探针与离屏运行脚本（不参与打包）
 
 ## 8. 变更记录
 
+- 2026-11-09 性能优化（GPU / 内存，三端通用）：
+  - **播放页重建粒度**：播放位置/时长/播放状态原先每 150ms 触发一次整页
+    `setState`，视频纹理层、封面、信息区、右侧互动栏全部跟着重建。现在这些
+    高频量只驱动底部控制条那一个子树（`ListenableBuilder` + `_uiTick`），
+    外层 build 在播放期间不再重跑；控制条淡出后连这个局部刷新也跳过，
+    播放稳定期 Flutter 侧完全不提交 UI 绘制，GPU 只做视频纹理合成。
+  - **GPU 回读**：`_awaitFirstFrameThenUnmute` 的亮度探测从每 70ms 一次
+    改为 140ms，采样比例 0.08 → 0.06，并加"连续两帧纯黑即停止"的短路；
+    切歌快照 `toImage` 的 pixelRatio 0.7 → 0.5；`sampleScreenBrightness`
+    的逐像素循环改为 3 像素步长跳采。三者都是 GPU→CPU 整块回读，在核显上
+    单次就要数毫秒并打断渲染管线。
+  - **封面模糊占位**：`_CoverBlur` 外套 `RepaintBoundary`（模糊结果缓存成
+    一层位图，不再每帧重算），sigma 16 → 8。
+  - **设置页**：运行状态卡片改为局部刷新，整页不再每秒重建。
+  - **内存回收**：`MemoryTrim` 补齐 macOS（`malloc_zone_pressure_relief`），
+    三端齐全；退出播放页后自动裁剪一次，首页滚动停止后按 20 秒节流回收。
+  - **目录布局跨平台**：视频缓存改由 `PlatformAdapter.videoCacheDir` 决定，
+    Linux 落在 `$XDG_CACHE_HOME`、macOS 落在 `~/Library/Caches`（原来
+    Linux 会误落到 `~/.config` 下堆视频文件）；应用数据目录同样收敛到
+    `PlatformAdapter.appDataDir`。
+  - **平台分支收敛**：播放页里残留的 `Platform.isMacOS` / `Platform.isWindows`
+    判断改为 `PlatformAdapter.mustDisableMpvDiskCache` / `openUrlCommand`，
+    业务代码不再直接判断操作系统。
 - 2026-11-07 跨平台改造：新增 `lib/core/platform_adapter.dart` 收敛三端差异，补齐
   Linux 分支与 macOS 联网 entitlements，编写 `BUILD.md`；删除已无引用的 WebView
   遗留代码 `lib/data/web_engine.dart`、`lib/data/feed_controller.dart`、

@@ -45,6 +45,13 @@ dependencies:
   # 自建 CGL/OpenGL 上下文与 Flutter 字形图集串扰导致的闪屏 / 文字碎裂。
   # 通过 --dart-define=PLAYER_BACKEND=fvp 在构建时选择，两套代码并存。
   fvp: ^0.40.0
+  # dependency_overrides：fvp 的传递依赖 video_player 拉进了
+  # video_player_avfoundation 2.12.x，其 Swift 源用了 `load(_:isolation:)`
+  # 的新签名，与 CI 的 Xcode 16.4 (swift-frontend 5) 不兼容
+  # （"extra argument 'isolation' in call"）。pin 到 2.11.1
+  # （2026-08-28 发布，无该语法），fvp 只把 video_player 当注册壳，
+  # 不走它的播放实现，降级无副作用。
+  video_player_avfoundation: 2.11.1
 
   # 持久化与桌面窗口
   shared_preferences: ^2.5.6
