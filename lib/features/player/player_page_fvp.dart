@@ -15,6 +15,7 @@ import 'package:window_manager/legacy.dart' as wm;
 
 import '../../core/app_settings.dart';
 import '../../core/diag.dart';
+import '../../core/diag_ui.dart';
 import '../../core/error_text.dart';
 import '../../core/ime_guard.dart';
 import '../../core/platform_adapter.dart';
@@ -207,6 +208,13 @@ class _PlayerPageState extends State<PlayerPage>
   int _openedSinceRecycle = 0;
   String? _playError;
 
+  /// 出现 [_playError] 时所在的播放位置。
+  ///
+  /// 用来判断这条"错误"是不是误报：如果浮层挂着的同时播放位置还在往前走，
+  /// 说明解码/播放其实正常（典型：libmdk 把缓冲进度当错误码抛出），
+  /// 1.2 秒后自动把浮层撤掉，不让红框一直挡住能正常播放的画面。
+  Duration _errorPosition = Duration.zero;
+
   /// 当前媒体是否已播到结尾：mpv 在结尾后会卸载轨道，此时再 seek 会报
   /// “error running command _command(seek)”。拖动/跳末尾前先重新打开当前条。
   bool _completed = false;
@@ -350,6 +358,8 @@ class _PlayerPageState extends State<PlayerPage>
       _cacheMode = envCacheMode == 'off' ? CacheMode.off : CacheMode.disk;
     }
     settings.addListener(_onSettingsChanged);
+    // 排障快照：用户点「复制诊断信息」时，把当前播放状态一并带上。
+    Diag.registerRuntime(_diagRuntimeSnapshot);
 
     _slideCtrl = AnimationController(
       vsync: this,
@@ -511,6 +521,8 @@ class _PlayerPageState extends State<PlayerPage>
         // 界面上只显示中文：mpv / libavformat 给的是英文原文，
         // 统一翻成可读的原因；原文仍然进 _logs 与 diag 供排障。
         _playError = message;
+        // 记下报错时的位置，后面用"位置是否继续推进"判断这条是不是误报。
+        _errorPosition = _position;
         _logs.add(line);
         if (_logs.length > 24) _logs.removeRange(0, _logs.length - 24);
       });
@@ -528,6 +540,16 @@ class _PlayerPageState extends State<PlayerPage>
       //      视频纹理层、封面、侧栏全部原样复用。
       // _position 本身始终更新为最新值，seek / 缓存补跳等逻辑读到的是准确位置。
       _position = p;
+      // 误报自愈：错误浮层挂着，但播放位置还在正常往前走，说明这条
+      // "错误"并不影响播放（典型：libmdk 把缓冲进度百分比当错误码抛出）。
+      // 1.2 秒后自动撤掉浮层，不让红框一直挡住能看的画面。
+      if (_playError != null &&
+          p - _errorPosition > const Duration(milliseconds: 1200)) {
+        diag('player',
+            '位置继续推进（${_errorPosition.inMilliseconds}→${p.inMilliseconds}ms），'
+            '判定为误报，自动撤掉错误浮层');
+        setState(() => _playError = null);
+      }
       final delta = (p - _lastUiPosition).inMilliseconds.abs();
       if (delta < 150) return;
       _lastUiPosition = p;
@@ -2321,6 +2343,7 @@ class _PlayerPageState extends State<PlayerPage>
               _ShortcutRow('N / P', '下一条 / 上一条'),
               _ShortcutRow('F', '全屏开关'),
               _ShortcutRow('Esc', '关闭抽屉 / 退出全屏'),
+              _ShortcutRow('Ctrl/⌘+Shift+D', '复制诊断信息（排障用）'),
               _ShortcutRow('F1 / ?', '打开本说明'),
             ],
           ),
@@ -2458,6 +2481,52 @@ class _PlayerPageState extends State<PlayerPage>
     // 不需要（也不应该）在这里等窗口动画结束再去"重建视频输出"：
     // 视频纹理保持视频原始尺寸，展示层由 FittedBox(BoxFit.contain) 缩放，
     // 窗口一变，下一帧布局就自动贴合。等待 + 重建只会引入黑屏空窗期。
+  }
+
+  /// 诊断用的播放器实时状态快照（只在用户点「复制诊断信息」时调用一次）。
+  ///
+  /// 刻意**不含**完整播放地址：真实地址带签名与过期参数，既冗长又敏感。
+  /// 排障需要的是"当前解码器/纹理/位置/错误文案"，这些都在下面。
+  String _diagRuntimeSnapshot() {
+    final item = _current;
+    String fmt(int ms) {
+      if (ms <= 0) return '00:00';
+      final d = Duration(milliseconds: ms);
+      final m = d.inMinutes.toString().padLeft(2, '0');
+      final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+      return '$m:$s';
+    }
+
+    final b = StringBuffer('-------- 播放器实时状态 --------\n');
+    b.writeln('作品: ${item.id}  ·  第 ${_index + 1}/${widget.items.length} 条');
+    b.writeln('清晰度: 偏好=$_qualityPref · 实际=${_activeQuality.isEmpty ? "未知" : _activeQuality}');
+    b.writeln('解码: 请求=${_hardware ? "硬解" : "软解"} · 实际=$_hwdecCurrent'
+        '${_hwSoftwareFallback ? "（硬件不可用，已回落软解）" : ""}');
+    b.writeln('编码/分辨率/帧率: $_codec / $_resolution / $_frameRate');
+    b.writeln('视频纹理: ${_renderHwAccel ? "TextureHW(OpenGL)" : "TextureSW(CVPixelBuffer)"}');
+    b.writeln('位置/时长: ${fmt(_position.inMilliseconds)} / ${fmt(_duration.inMilliseconds)}'
+        '（${_position.inMilliseconds}ms / ${_duration.inMilliseconds}ms）');
+    b.writeln('状态: ${_playing ? "播放中" : "暂停"} · 速度 ${_speed}x'
+        ' · 音量 ${_volume.round()}${_muted ? "（静音）" : ""}');
+    b.writeln('视频缓存: ${_cacheStatusLine()}');
+    b.writeln('打开中=$_opening · 切换中=$_switching · 已重试 $_retryCount 次'
+        ' · 本页已打开 $_openedSinceRecycle 次');
+    if (_playError != null) b.writeln('错误浮层: $_playError');
+    return b.toString();
+  }
+
+  /// 一键复制诊断信息：运行环境 + 设置 + 播放器状态 + 最近日志。
+  Future<void> _copyDiagnostics() async {
+    final note = _playError == null ? '播放页' : '播放页/错误浮层';
+    diag('diag', '用户触发复制诊断（$note）');
+    try {
+      final length = await DiagUi.copyReport(note: note);
+      if (!mounted) return;
+      _toast('诊断信息已复制（$length 字符），可直接粘贴发送');
+    } catch (e) {
+      if (!mounted) return;
+      _toast('复制失败：$e');
+    }
   }
 
   void _toast(String message) {
@@ -2807,6 +2876,7 @@ class _PlayerPageState extends State<PlayerPage>
     // 离开播放页：取消所有预取任务，避免后台还在下已经不会看的视频。
     // 已下完的文件留在磁盘，下次进来直接命中（跨页面复用）。
     AppSettings.instance.removeListener(_onSettingsChanged);
+    Diag.unregisterRuntime(_diagRuntimeSnapshot);
     if (_cacheEnabled) {
       _cache.cancelExcept(const {});
       _cache.markActive(null, previous: _localPath);
@@ -2956,6 +3026,15 @@ class _PlayerPageState extends State<PlayerPage>
           }
           if (keyIs(LogicalKeyboardKey.escape, PhysicalKeyboardKey.escape)) {
             _handleEsc();
+            return KeyEventResult.handled;
+          }
+          // Ctrl/⌘ + Shift + D：一键复制诊断信息。
+          // 放在 Esc 之后、ignored 之前，不抢任何单键快捷键。
+          if (keyIs(LogicalKeyboardKey.keyD, PhysicalKeyboardKey.keyD) &&
+              HardwareKeyboard.instance.isShiftPressed &&
+              (HardwareKeyboard.instance.isControlPressed ||
+                  HardwareKeyboard.instance.isMetaPressed)) {
+            unawaited(_copyDiagnostics());
             return KeyEventResult.handled;
           }
           return KeyEventResult.ignored;
@@ -3115,6 +3194,11 @@ class _PlayerPageState extends State<PlayerPage>
                           _PlayErrorOverlay(
                             message: _playError!,
                             onRetry: _retry,
+                            onCopyDiagnostics: _copyDiagnostics,
+                            onDismiss: () {
+                              diag('player', '用户手动关闭错误浮层：$_playError');
+                              setState(() => _playError = null);
+                            },
                           ),
                         // 顶部返回 + 标题
                         Positioned(
@@ -3192,6 +3276,7 @@ class _PlayerPageState extends State<PlayerPage>
                                   : '软件纹理（稳定）',
                               logs: _logs,
                               onToggleHardware: _toggleHardware,
+                              onCopyDiagnostics: _copyDiagnostics,
                             ),
                           ),
                         // 底部控制条
@@ -3921,10 +4006,23 @@ class _CoverBlur extends StatelessWidget {
 }
 
 class _PlayErrorOverlay extends StatelessWidget {
-  const _PlayErrorOverlay({required this.message, required this.onRetry});
+  const _PlayErrorOverlay({
+    required this.message,
+    required this.onRetry,
+    required this.onCopyDiagnostics,
+    required this.onDismiss,
+  });
 
   final String message;
   final VoidCallback onRetry;
+
+  /// 一键把诊断信息（环境 + 播放状态 + 最近日志）复制到剪贴板。
+  /// 播放异常时用户最需要的就是这个：不用描述现象，粘一段文字给开发者即可。
+  final VoidCallback onCopyDiagnostics;
+
+  /// 关掉浮层继续看。用于"报错了但画面其实能播"的情况，
+  /// 不让红框一直挡在画面中间。
+  final VoidCallback onDismiss;
 
   @override
   Widget build(BuildContext context) {
@@ -3949,7 +4047,29 @@ class _PlayErrorOverlay extends StatelessWidget {
                   color: Color(0xFFDDDDDD), fontSize: 12.5, height: 1.5),
             ),
             const SizedBox(height: 14),
-            OutlinedButton(onPressed: onRetry, child: const Text('重试')),
+            Wrap(
+              spacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                OutlinedButton(onPressed: onRetry, child: const Text('重试')),
+                OutlinedButton.icon(
+                  onPressed: onCopyDiagnostics,
+                  icon: const Icon(Icons.copy_all, size: 15),
+                  label: const Text('复制诊断'),
+                ),
+                TextButton(
+                  onPressed: onDismiss,
+                  child: const Text('关闭',
+                      style: TextStyle(color: Color(0xFF9A9A9A))),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '复制后可直接粘贴发给开发者定位问题，内容不含账号与播放地址。',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Color(0xFF7C7C7C), fontSize: 10, height: 1.4),
+            ),
           ],
         ),
       ),

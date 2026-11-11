@@ -10,6 +10,7 @@ import 'package:window_manager/legacy.dart';
 import 'app.dart';
 import 'core/app_settings.dart';
 import 'core/diag.dart';
+import 'core/diag_ui.dart';
 import 'core/login_probe.dart';
 import 'core/platform_adapter.dart';
 import 'core/player_backend_config.dart';
@@ -22,6 +23,11 @@ import 'features/player/decode_probe.dart';
 Future<void> main() async {
   kStartupWatch = Stopwatch()..start();
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 诊断必须最先装：后面每一步（libmpv 加载、设置读取、首屏）的日志
+  // 都要能被「复制诊断信息」带走。日志默认落盘到应用数据目录下的
+  // logs/diag.log，超过 4MB 自动轮转，用户不需要配置任何环境变量。
+  DiagUi.install();
 
   // 长列表会缓存大量封面图，把 Flutter 图片缓存上限压到 16MB / 120 项，
   // 避免连续滚动后内存一路涨（封面本身已按 memCacheWidth 限宽解码）。
@@ -52,6 +58,16 @@ Future<void> main() async {
   if (Platform.environment['DOUYIN_DECODE_PROBE'] == '1') {
     await runDecodeProbe();
     return;
+  }
+
+  // 诊断探针：把「一键复制诊断」会得到的那份报告直接写到指定文件后退出。
+  // 用途：不建窗口就能验证报告内容（排障功能自身的自测），也方便 CI 抓取。
+  final diagDump = Platform.environment['DOUYIN_DIAG_DUMP'];
+  if (diagDump != null && diagDump.isNotEmpty) {
+    final report = await Diag.buildReport(note: 'DOUYIN_DIAG_DUMP');
+    File(diagDump).writeAsStringSync(report);
+    stdout.writeln('诊断报告已写入 $diagDump（${report.length} 字符）');
+    exit(0);
   }
 
   // 登录探针：不建窗口，直接在真实进程里跑「已登录 profile → 读到登录态 → 落盘」。

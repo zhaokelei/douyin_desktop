@@ -16,7 +16,6 @@
 // 行为的（hwdec / hwdec-current / width / height）做了语义映射。
 
 import 'dart:async';
-import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:fvp/mdk.dart' as mdk;
@@ -225,12 +224,29 @@ class Player {
       if (e.category == 'decoder.video' && e.detail.isNotEmpty) {
         _currentDecoder = e.detail;
       }
-      if (e.error != 0) {
+
+      // 关键：mdk 的 `MediaEvent.error` **不是**统一的错误码。
+      //
+      // 官方类型注释写得很清楚：
+      //   `int error; // progress value [0, 100] if category is
+      //               // "reader.buffering"`
+      // 也就是说：
+      //   - `reader.buffering` → error 是**缓冲进度百分比**（78/80/88/…/100）；
+      //   - `thread.audio` / `thread.video` → 线程状态码（1 = 正常退出）；
+      //   - 真正的错误码是**负数**（mdk 的 MEDIA_ERR_* 全部 < 0）。
+      //
+      // 旧实现写的是 `if (e.error != 0) → 抛播放错误`，于是抖音这种
+      // 边下边播的流每推进一点缓冲进度就报一次“播放失败”，用户明明
+      // 看着画面在正常播放，屏幕中央却一直挂着红色错误浮层 + 重试按钮。
+      if (e.error < 0) {
         if (!_errorCtl.isClosed) {
           _errorCtl.add('${e.category}: ${e.detail} (${e.error})');
         }
-      } else if (e.category.isNotEmpty && !_logCtl.isClosed) {
-        _logCtl.add(LogEvent(e.category, e.detail));
+        return;
+      }
+      if (!_logCtl.isClosed) {
+        final detail = e.detail.isEmpty ? '${e.error}' : '${e.detail} (${e.error})';
+        _logCtl.add(LogEvent(e.category, detail));
       }
     }));
 

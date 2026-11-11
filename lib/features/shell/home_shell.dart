@@ -359,6 +359,9 @@ class _HomeShellState extends State<HomeShell> {
     // 补齐首屏（必须在 _loading 复位之后，否则 _loadMore 会被拦住）。
     await _fillViewport();
     diag('home', '首屏就绪，冷启动耗时 ${kStartupWatch?.elapsedMilliseconds ?? -1} ms');
+    // 首屏就绪即停止计时：诊断报告里的「启动耗时」取的就是这个值，
+    // 不 stop 的话它会把"已经运行了多久"当成启动耗时。
+    kStartupWatch?.stop();
     _maybeAutoplay();
   }
 

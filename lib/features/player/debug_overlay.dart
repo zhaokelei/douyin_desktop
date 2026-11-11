@@ -13,6 +13,7 @@ class DebugOverlay extends StatelessWidget {
     required this.hardwareEnabled,
     required this.logs,
     required this.onToggleHardware,
+    this.onCopyDiagnostics,
     this.softwareFallback = false,
     this.cacheLine = '',
     this.renderBackend = '',
@@ -25,6 +26,9 @@ class DebugOverlay extends StatelessWidget {
   final bool hardwareEnabled;
   final List<String> logs;
   final VoidCallback onToggleHardware;
+
+  /// 一键复制诊断信息（环境 + 播放状态 + 最近日志到剪贴板）。
+  final VoidCallback? onCopyDiagnostics;
 
   /// 开了硬件解码开关，但 mpv 实际回落到软解（硬件/驱动不支持）。
   final bool softwareFallback;
@@ -122,6 +126,27 @@ class DebugOverlay extends StatelessWidget {
             '切换后会重新打开当前视频，便于对比硬解与软解的 CPU 占用。',
             style: TextStyle(color: Color(0xFF7C7C7C), fontSize: 10.5, height: 1.4),
           ),
+          // 排障入口：异常时用户不用描述现象，复制一段文字即可。
+          if (onCopyDiagnostics != null) ...[
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              height: 27,
+              child: OutlinedButton.icon(
+                onPressed: onCopyDiagnostics,
+                icon: const Icon(Icons.copy_all, size: 13),
+                label: const Text('复制诊断信息',
+                    style: TextStyle(fontSize: 11)),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFDDDDDD),
+                  side: const BorderSide(color: Color(0xFF3A3A3A)),
+                  padding: EdgeInsets.zero,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(5)),
+                ),
+              ),
+            ),
+          ],
           if (logs.isNotEmpty) ...[
             const SizedBox(height: 8),
             const Divider(height: 1),

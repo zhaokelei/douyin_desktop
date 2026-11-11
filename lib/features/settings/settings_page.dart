@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../../core/app_settings.dart';
+import '../../core/diag.dart';
+import '../../core/diag_ui.dart';
 import '../../core/memory_trim.dart';
 import '../../data/video_cache.dart';
 
@@ -61,6 +63,30 @@ class _SettingsPageState extends State<SettingsPage> {
     if (!mounted) return;
     setState(() {});
     _snack('已删除 ${((before - _cache.usedBytes) / (1024 * 1024)).toStringAsFixed(1)} MB 缓存');
+  }
+
+  /// 一键复制诊断信息：环境 + 设置 + 播放器状态 + 最近日志。
+  Future<void> _copyDiagnostics() async {
+    try {
+      final length = await DiagUi.copyReport(note: '设置页');
+      _snack('诊断信息已复制（$length 字符），直接粘贴发送即可');
+    } catch (e) {
+      _snack('复制失败：$e');
+    }
+  }
+
+  Future<void> _exportDiagnostics() async {
+    try {
+      final path = await DiagUi.exportReport(note: '设置页');
+      _snack('已导出诊断文件：$path');
+    } catch (e) {
+      _snack('导出失败：$e');
+    }
+  }
+
+  Future<void> _revealLogDir() async {
+    final ok = await DiagUi.openLogDir();
+    if (!ok) _snack('打不开文件管理器，请手动前往：${DiagUi.logDir}');
   }
 
   @override
@@ -241,11 +267,50 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ],
           ),
+          const SizedBox(height: 16),
+          _SectionCard(
+            title: '诊断与日志',
+            icon: Icons.bug_report_outlined,
+            children: [
+              const _Hint(
+                '遇到播放异常、闪屏、卡顿、解码失败时，点「复制诊断信息」，'
+                '把复制到的内容直接发给开发者即可定位，不需要截图描述现象。'
+                '内容包含运行环境、当前设置、播放器实时状态与最近运行日志，'
+                '不含账号凭证和视频地址。',
+              ),
+              const SizedBox(height: 10),
+              _ActionButton(
+                label: '复制诊断信息',
+                icon: Icons.copy_all,
+                onTap: () => unawaited(_copyDiagnostics()),
+              ),
+              const SizedBox(height: 8),
+              _ActionButton(
+                label: '导出诊断文件',
+                icon: Icons.save_alt,
+                onTap: () => unawaited(_exportDiagnostics()),
+              ),
+              const SizedBox(height: 8),
+              _ActionButton(
+                label: '打开日志目录',
+                icon: Icons.folder_open,
+                onTap: () => unawaited(_revealLogDir()),
+              ),
+              const SizedBox(height: 12),
+              const _SubLabel('日志位置'),
+              const SizedBox(height: 6),
+              SelectableText(
+                Diag.logPath,
+                style: const TextStyle(
+                    color: Color(0xFF9A9A9A), fontSize: 11, height: 1.5),
+              ),
+            ],
+          ),
           const SizedBox(height: 22),
-          const Center(
+          Center(
             child: Text(
-              '抖音桌面版 · Flutter',
-              style: TextStyle(color: Color(0xFF5A5A5A), fontSize: 11.5),
+              '抖音桌面版 · Flutter $kAppVersion',
+              style: const TextStyle(color: Color(0xFF5A5A5A), fontSize: 11.5),
             ),
           ),
         ],

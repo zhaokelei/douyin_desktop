@@ -254,7 +254,7 @@ codesign -d --entitlements :- build/macos/Build/Products/Release/douyin_desktop.
 | `DOUYIN_LIBMPV` / `LIBMPV_LIBRARY_PATH` | 指定 libmpv 绝对路径，覆盖候选名探测 |
 | `DOUYIN_HWDEC=no` | 强制软解，用于对比硬解 |
 | `DOUYIN_COOKIES` | Cookie 文件绝对路径（默认找 exe 同目录的 `douyin_cookies.json`） |
-| `DOUYIN_LOG` | diag 日志路径 |
+| `DOUYIN_LOG` | diag 日志路径（不设也有默认日志，见第 6 节） |
 | `DOUYIN_API_BASE` | 覆盖接口域名（异常路径自测） |
 | `DOUYIN_SHOT` / `DOUYIN_SHOT_DELAY` | 离屏自截图（窗口移到 -3000,-3000，不弹窗） |
 
@@ -272,3 +272,14 @@ codesign -d --entitlements :- build/macos/Build/Products/Release/douyin_desktop.
 | macOS 打开后一直转圈、接口全失败 | `codesign -d --entitlements :-` 确认 `network.client` 在签名里 |
 | macOS 报 `code signature invalid`（加载 dylib） | Release 签名是否带 `disable-library-validation`，dylib 是否已单独签名 |
 | Windows 首次构建卡在 Downloading | 需要联网；或按第 1 节手动放 `libmpv-2.dll` |
+| 用户报「播放失败 / 闪屏 / 卡顿」但描述不清 | 让对方点错误浮层的「复制诊断」，或设置页 →「诊断与日志」→ 复制诊断信息；文本含环境、设置、播放状态与最近 400 条日志 |
+
+### 诊断数据在哪
+
+- 默认日志：`<应用数据目录>/logs/diag.log`，超过 4MB 轮转为 `diag.1.log`。
+  - Windows `%APPDATA%\douyin_desktop\logs`
+  - macOS `~/Library/Application Support/douyin_desktop/logs`
+  - Linux `$XDG_CONFIG_HOME/douyin_desktop/logs`
+- 一键复制报告 = 运行环境 + 用户设置 + 播放器实时状态 + 最近 400 条日志；
+  快捷键 `Ctrl/⌘ + Shift + D`。报告不含 Cookie / 账号 / 播放地址。
+- 自测时可仍用 `DOUYIN_LOG=<path>` 覆盖落盘位置（离屏探针依赖它）。
