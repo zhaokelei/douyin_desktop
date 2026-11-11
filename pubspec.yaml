@@ -36,9 +36,15 @@ dependencies:
   cupertino_icons: ^1.0.8
 
   # 播放：libmpv（桌面三端统一；硬解按平台取 d3d11va / videotoolbox / auto-safe）
+  # 灰度迁移期间**保留不动**，mpv 版仍是默认后端。
   media_kit: ^1.2.6
   media_kit_video: ^2.0.1
   media_kit_libs_video: ^1.0.7
+
+  # 灰度后端：libmdk。macOS 走 Metal 渲染，从根上绕开 mpv TextureHW
+  # 自建 CGL/OpenGL 上下文与 Flutter 字形图集串扰导致的闪屏 / 文字碎裂。
+  # 通过 --dart-define=PLAYER_BACKEND=fvp 在构建时选择，两套代码并存。
+  fvp: ^0.40.0
 
   # 持久化与桌面窗口
   shared_preferences: ^2.5.6

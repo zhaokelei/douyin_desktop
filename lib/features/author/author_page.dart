@@ -10,7 +10,7 @@ import '../../core/platform_style.dart';
 import '../../core/verify_gate.dart';
 import '../../data/douyin_api.dart';
 import '../../data/models.dart';
-import '../player/player_page.dart';
+import '../player/player_entry.dart';
 
 /// 作者主页「TA的作品」：网格列表 + 触底分页 + 点开直接播放。
 ///
@@ -138,7 +138,7 @@ class _AuthorPageState extends State<AuthorPage> {
 
   void _openItem(int index) {
     Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => PlayerPage(
+      builder: (_) => buildPlayerPage(
         api: widget.api,
         items: List<AwemeItem>.from(_items),
         initialIndex: index,

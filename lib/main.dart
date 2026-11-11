@@ -12,6 +12,7 @@ import 'core/app_settings.dart';
 import 'core/diag.dart';
 import 'core/login_probe.dart';
 import 'core/platform_adapter.dart';
+import 'core/player_backend_config.dart';
 import 'core/screen_probe.dart';
 import 'features/player/decode_probe.dart';
 
@@ -29,13 +30,19 @@ Future<void> main() async {
 
   // media_kit 的桌面内核是 libmpv，三端共用；硬解由 mpv 的 hwdec 决定。
   // 未显式指定路径时交给 media_kit 按平台候选名逐个探测；缺库时给出中文提示。
-  try {
-    MediaKit.ensureInitialized(libmpv: PlatformAdapter.libmpvOverride);
-  } catch (e) {
-    stderr.writeln(PlatformAdapter.libmpvFailureHint(e));
-    diag('startup', 'libmpv 加载失败: $e');
-    exit(1);
+  //
+  // 灰度开关：fvp 版整条播放链走 libmdk，不加载 libmpv，也不因缺库退出。
+  // 这是编译期分支，mpv 版走的路径与改动前完全一致。
+  if (!isFvpBackend) {
+    try {
+      MediaKit.ensureInitialized(libmpv: PlatformAdapter.libmpvOverride);
+    } catch (e) {
+      stderr.writeln(PlatformAdapter.libmpvFailureHint(e));
+      diag('startup', 'libmpv 加载失败: $e');
+      exit(1);
+    }
   }
+  diag('startup', '播放器后端=$playerBackendLabel');
 
   // 用户设置（解码方式 / 缓存策略 / 默认清晰度）：启动前读一次，
   // 避免首帧先按默认值渲染再跳变。

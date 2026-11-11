@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart';
 import '../../core/app_settings.dart';
 import '../../core/diag.dart';
 import '../../core/error_text.dart';
+import '../../core/memory_trim.dart';
 import '../../core/verify_gate.dart';
 import '../../data/douyin_api.dart';
 import '../../data/models.dart';
@@ -14,7 +15,7 @@ import '../../data/session_store.dart';
 import '../../data/video_cache.dart';
 import '../feed/video_card.dart';
 import '../login/login_page.dart';
-import '../player/player_page.dart';
+import '../player/player_entry.dart';
 import '../settings/settings_page.dart';
 
 /// 主界面：纯 HTTP 拉取抖音推荐流，不包含任何 WebView。
@@ -382,7 +383,7 @@ class _HomeShellState extends State<HomeShell> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => PlayerPage(
+        builder: (_) => buildPlayerPage(
           api: _api,
           items: _items,
           initialIndex: 0,
@@ -439,6 +440,26 @@ class _HomeShellState extends State<HomeShell> {
     if (p.pixels >= p.maxScrollExtent - 200) {
       _loadMore();
     }
+  }
+
+  /// 滚动停止后把这一轮新解码的封面空闲页还给系统。
+  ///
+  /// 只在不加载、且距上次回收超过 20 秒时触发：连续滚动时每停一次都裁剪
+  /// 会让系统反复缺页，反而拖慢下一屏的解码。
+  bool _trimOnScrollEndScheduled = false;
+
+  bool _onScrollNotification(ScrollNotification n) {
+    if (n is ScrollEndNotification) {
+      if (!_trimOnScrollEndScheduled) {
+        _trimOnScrollEndScheduled = true;
+        // 等这一帧的图片解码与上传纹理都完成，再裁剪才有意义。
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _trimOnScrollEndScheduled = false;
+          if (mounted && !_loading) MemoryTrim.trimWhenIdle();
+        });
+      }
+    }
+    return false;
   }
 
   /// 抖音推荐流每次只返回少量条目，所以"加载更多"要多次请求并去重。
@@ -543,39 +564,54 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   Widget _buildList() {
-    return ListView.separated(
-      controller: _scroll,
-      padding: const EdgeInsets.fromLTRB(20, 14, 20, 28),
-      itemCount: _items.length + 2,
-      separatorBuilder: (_, _) => const SizedBox(height: 10),
-      itemBuilder: (context, index) {
-        if (index == 0) return const SizedBox.shrink();
-        if (index <= _items.length) {
-          final item = _items[index - 1];
-          return VideoCard(
-            key: ValueKey(item.id),
-            item: item,
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => PlayerPage(
-                  api: _api,
-                  // 传同一个列表引用：播放页刷到尾部时，这里追加的条目
-                  // 播放页能直接看到，不需要重建页面。
-                  items: _items,
-                  initialIndex: index - 1,
-                  onLoadMore: _loadMoreForPlayer,
-                ),
-              ),
-            ),
+    return NotificationListener<ScrollNotification>(
+      onNotification: _onScrollNotification,
+      child: ListView.separated(
+        controller: _scroll,
+        padding: const EdgeInsets.fromLTRB(20, 14, 20, 28),
+        itemCount: _items.length + 2,
+        // 每张卡片独立成重绘边界：悬停态切换、封面淡入都只重绘那一张，
+        // 不会把整屏卡片连带重绘。长列表滚动时这一项对核显影响明显。
+        addRepaintBoundaries: true,
+        separatorBuilder: (_, _) => const SizedBox(height: 10),
+        itemBuilder: (context, index) {
+          if (index == 0) return const SizedBox.shrink();
+          if (index <= _items.length) {
+            final item = _items[index - 1];
+            return VideoCard(
+              key: ValueKey(item.id),
+              item: item,
+              onTap: () async {
+                await Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => buildPlayerPage(
+                      api: _api,
+                      // 传同一个列表引用：播放页刷到尾部时，这里追加的条目
+                      // 播放页能直接看到，不需要重建页面。
+                      items: _items,
+                      initialIndex: index - 1,
+                      onLoadMore: _loadMoreForPlayer,
+                    ),
+                  ),
+                );
+                // 退出播放页后把解码器释放掉的空闲页还给系统。
+                // 播放页 dispose 是异步的（mpv 线程收尾），稍等一拍再裁剪，
+                // 否则容易裁在"正在释放"的中间态上，效果打折。
+                unawaited(Future<void>.delayed(
+                  const Duration(milliseconds: 300),
+                  MemoryTrim.trim,
+                ));
+              },
+            );
+          }
+          return _Footer(
+            loading: _loading,
+            error: _error,
+            hasMore: _hasMore,
+            onRetry: _loadMore,
           );
-        }
-        return _Footer(
-          loading: _loading,
-          error: _error,
-          hasMore: _hasMore,
-          onRetry: _loadMore,
-        );
-      },
+        },
+      ),
     );
   }
 }
