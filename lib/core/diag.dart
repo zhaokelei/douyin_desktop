@@ -50,7 +50,14 @@ class Diag {
 
   /// 报告里附带的日志行数上限：太长反而不方便粘贴到聊天窗口。
   /// 完整日志仍在内存缓冲 / 日志文件里，导出或打开目录就能拿到。
-  static const int maxReportLines = 400;
+  static const int maxReportLines = 120;
+
+  /// 报告前半段"关键事件"的条数上限（已滤掉播放器原始日志）。
+  static const int maxKeyLines = 160;
+
+  /// 播放器原始日志的 tag：libmpv / libmdk 的逐行输出量极大，
+  /// 且几乎全是缓冲进度、属性轮询这类噪音。报告里只作为附录给尾部若干行。
+  static const Set<String> rawLogTags = {'mpv', 'mpv-props', 'avtrace'};
 
   static final List<DiagEntry> _entries = <DiagEntry>[];
   static final List<String Function()> _providers = <String Function()>[];
@@ -102,7 +109,7 @@ class Diag {
 
   /// 写一条日志。签名与旧实现一致，调用点无需改动。
   static void log(String tag, String message) {
-    final entry = DiagEntry(DateTime.now(), tag, message);
+    final entry = DiagEntry(DateTime.now(), tag, redact(message));
     _entries.add(entry);
     if (_entries.length > maxEntries) {
       final remove = _entries.length - maxEntries;
@@ -111,7 +118,7 @@ class Diag {
     }
     final path = _logPath;
     if (path == null || _fileBroken) return;
-    _pending.write('${stamp(entry.at)} [$tag] ${_oneLine(message)}\n');
+    _pending.write('${stamp(entry.at)} [$tag] ${_oneLine(entry.message)}\n');
     // 量大时（比如 mpv 疯狂重试）不等定时器，尽快摊到磁盘上。
     if (_pending.length > 48 * 1024) unawaited(flush());
   }
@@ -201,8 +208,26 @@ class Diag {
     }
     b.writeln();
 
-    b.writeln('-------- 日志（最近 ${_entries.length} 条'
-        '${_dropped > 0 ? "，已丢弃更早的 $_dropped 条" : ""}）--------');
+    final keyLines = <DiagEntry>[];
+    for (var i = _entries.length - 1;
+        i >= 0 && keyLines.length < maxKeyLines;
+        i--) {
+      if (rawLogTags.contains(_entries[i].tag)) continue;
+      keyLines.add(_entries[i]);
+    }
+    b.writeln('-------- 关键事件（业务日志，最近 ${keyLines.length} 条）--------');
+    if (keyLines.isEmpty) {
+      b.writeln('（无）');
+    } else {
+      for (final e in keyLines.reversed) {
+        b.writeln('${stamp(e.at)} [${e.tag}] ${_oneLine(e.message)}');
+      }
+    }
+    b.writeln();
+
+    b.writeln('-------- 原始日志（最近 ${_entries.length} 条'
+        '${_dropped > 0 ? "，已丢弃更早的 $_dropped 条" : ""}'
+        '，仅尾部 $maxReportLines 行）--------');
     final start = _entries.length > maxReportLines
         ? _entries.length - maxReportLines
         : 0;
@@ -218,6 +243,24 @@ class Diag {
   static void recordCrash(Object error, StackTrace? stack) {
     _lastCrash = '${stamp(DateTime.now())} $error';
     log('crash', '$error\n${stack ?? StackTrace.empty}');
+  }
+
+  /// URL 脱敏。
+  ///
+  /// 播放器日志会把整条播放地址打出来，而抖音的地址带 `sign` /
+  /// `biz_sign` 等签名参数：既能定位到具体账号看了什么，也有时效性。
+  /// 诊断报告是要交给开发者看的，所以统一把 query 段抹掉——
+  /// host + path 足够判断"是不是 CDN、走的哪个接口"，签名不需要。
+  static final RegExp _urlPattern = RegExp(r'https?://[^\s"<>]+');
+
+  static String redact(String text) {
+    if (!text.contains('http')) return text;
+    return text.replaceAllMapped(_urlPattern, (m) {
+      final raw = m.group(0)!;
+      final q = raw.indexOf('?');
+      if (q < 0) return raw;
+      return '${raw.substring(0, q)}?<已脱敏>';
+    });
   }
 
   // ------------------------------------------------------------------ 内部

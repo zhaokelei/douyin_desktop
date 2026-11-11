@@ -244,9 +244,15 @@ class Player {
         }
         return;
       }
+      // `reader.buffering` 不是事件而是**进度**：每个百分点都写一条日志，
+      // 一条视频就是几十行，把环形缓冲和报告全占满。缓冲状态已经通过
+      // onMediaStatus → buffering 流送到播放页了，这里直接丢掉。
+      if (e.category == 'reader.buffering') return;
       if (!_logCtl.isClosed) {
-        final detail = e.detail.isEmpty ? '${e.error}' : '${e.detail} (${e.error})';
-        _logCtl.add(LogEvent(e.category, detail));
+        // detail 为空（thread.audio / thread.video 这类）时不要把状态码
+        // 拼进去——`thread.audio: (1)` 只会让人误以为是错误。
+        _logCtl.add(LogEvent(
+            e.category, e.detail.isEmpty ? '' : e.detail));
       }
     }));
 
@@ -267,9 +273,9 @@ class Player {
 
     // libmdk 的日志是全局回调，灰度期同时只存在一个 Player。
     mdk.setLogHandler((level, text) {
-      if (!_disposed && !_logCtl.isClosed) {
-        _logCtl.add(LogEvent(level.name, text));
-      }
+      if (_disposed || _logCtl.isClosed) return;
+      if (_noisyLog.hasMatch(text)) return;
+      _logCtl.add(LogEvent(level.name, text));
     });
   }
 
@@ -292,6 +298,23 @@ class Player {
   Timer? _positionTimer;
   bool _disposed = false;
   bool _completed = false;
+
+  /// 打开世代：后台补纹理时用来判断"这是不是当前这条媒体"。
+  int _openSeq = 0;
+
+  /// 我们自己的超时哨兵值。mdk 的真实错误码都是负数，但不保证没有
+  /// 恰好等于某个值的可能，用一个远离它们的大负数最安全。
+  static const int _timeoutCode = -9999;
+
+  /// 刷屏日志：边下边播时 mdk 会按缓冲百分比逐行打印（4%/9%/13%…），
+  /// 一条视频几十行，两分钟就能把 2000 条内存缓冲占满，真正有用的行
+  /// （错误、解码器切换、EOF）全被挤出去——用户复制出来的诊断报告里
+  /// 只剩这类噪音，反而看不出问题。
+  static final RegExp _noisyLog = RegExp(
+    r'buffering progress|BUFFERING (START|END)|update MediaStatus|'
+    r'check loop range|range loop end|before changed\(\)',
+  );
+
   int _durationMs = 0;
   double _volume = 100;
   Size? _videoSize;
@@ -322,6 +345,7 @@ class Player {
 
   Future<void> open(Media media, {bool play = true}) async {
     _completed = false;
+    final seq = ++_openSeq;
     if (!_completedCtl.isClosed) _completedCtl.add(false);
     _applyDecoders(_requestedHwdec != 'no');
 
@@ -333,18 +357,63 @@ class Player {
     }
     _mdk.media = media.uri;
 
-    final ret = await _mdk.prepare();
+    // prepare 必须有上限。
+    //
+    // 抖音 CDN 偶发"连上了但一直不回数据"，此时 mdk 的 prepared 回调
+    // 永远不来，`_prepared` 这个 Completer 也就永远不完成——旧实现
+    // `await _mdk.prepare()` 会把整个 open() 挂在半空，播放页的
+    // `_switching` 锁再也放不开（用户看到的现象：一直转「加载中…」，
+    // 上下键切条全部失效，只能杀进程）。
+    final ret = await _mdk
+        .prepare()
+        .timeout(const Duration(seconds: 12), onTimeout: () => _timeoutCode);
     if (ret < 0) {
-      if (!_errorCtl.isClosed) _errorCtl.add('媒体打开失败或格式不支持');
+      if (!_errorCtl.isClosed) {
+        _errorCtl.add(ret == _timeoutCode
+            ? '打开超时：12 秒内没有完成媒体解析'
+            : '媒体打开失败或格式不支持');
+      }
       return;
     }
     _durationMs = _mdk.mediaInfo.duration;
     if (!_durationCtl.isClosed) {
       _durationCtl.add(Duration(milliseconds: _durationMs));
     }
-    _videoSize = await _mdk.textureSize;
-    // 每条视频重建纹理：libmdk 会先释放旧的，不会像 mpv 那样累积内存。
-    await _mdk.updateTexture();
+
+    // 纹理尺寸同理，而且这是**最容易永久挂住**的一处：
+    // fvp 只在收到 `loaded` 状态或 `decoder.video` 事件时才完成
+    // `_videoSize`；进入 `loading` 时它还会被换成一个新的 Completer。
+    // 源码注释原话是 "that future may never complete"。旧实现直接
+    // `await _mdk.textureSize`，坏源/EOF 后的重开场景就会永久卡死。
+    // 现在最多等 1.8 秒，等不到就放行 open，后台补上、补到再建纹理。
+    final size = await _mdk.textureSize
+        .timeout(const Duration(milliseconds: 1800), onTimeout: () => null);
+    if (size != null) {
+      _videoSize = size;
+      // 每条视频重建纹理：libmdk 会先释放旧的，不会像 mpv 那样累积内存。
+      try {
+        await _mdk.updateTexture().timeout(
+            const Duration(milliseconds: 2500),
+            onTimeout: () => _timeoutCode);
+      } catch (_) {
+        // 建纹理失败不该阻断播放：Video 先显示纯黑底，下次 open 会重建。
+      }
+    } else {
+      // 尺寸还没到：不阻塞 open。
+      // `textureId` 是 ValueNotifier，`Video` 监听它；后台补齐尺寸并建好
+      // 纹理后，界面会自动重绘，不需要播放页额外刷新。
+      unawaited(_mdk.textureSize.then((s) async {
+        // 期间用户可能已经切到别的视频：世代不匹配就直接放弃，
+        // 否则会把旧媒体的纹理建到新媒体的会话上。
+        if (_disposed || s == null || seq != _openSeq) return;
+        _videoSize = s;
+        try {
+          await _mdk.updateTexture();
+        } catch (_) {
+          // 同上：失败就留黑底。
+        }
+      }));
+    }
     if (play) await this.play();
   }
 

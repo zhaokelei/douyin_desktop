@@ -128,6 +128,20 @@ class _PlayerPageState extends State<PlayerPage>
   bool _opening = false;
   bool _switching = false;
 
+  /// 在途 open 的起始时刻：看门狗据此判断"这次 open 是不是卡住了"。
+  DateTime? _switchStartedAt;
+
+  /// 在途 open 期间用户又按了切换：记下最后一次请求，等前一次收尾后补开。
+  /// 老实现是直接 `if (_switching) return;`，等于**静默丢弃**用户操作。
+  Future<void> Function()? _pendingOpen;
+
+  /// 切换看门狗：后端 prepare/取纹理永久挂起时，_switching 必须能被放开，
+  /// 否则整个播放页从此再也不能切视频（只能看到一直转圈的「加载中…」）。
+  Timer? _switchWatchdog;
+
+  /// 看门狗阈值：比 shim 里 prepare(12s) + 取纹理(3s) 的总和再多留余量。
+  static const Duration _switchHardTimeout = Duration(seconds: 22);
+
   /// 首帧到达后撤掉加载遮罩的延时器；切换时重置。
   Timer? _firstFrameTimer;
 
@@ -474,6 +488,9 @@ class _PlayerPageState extends State<PlayerPage>
       // 现在：日志照旧进 diag 落盘，但只有在调试面板真的打开时才更新 UI，
       // 并且合并到最多每 500ms 一次。
       if (!_showDebug) return;
+      // debug 级别（缓冲进度、属性轮询、EOS 循环判定）对用户没有意义，
+      // 只会把面板刷成一片看不懂的英文。info / warn / error 才进面板。
+      if (event.level == 'debug') return;
       _pendingLogs.add('[${event.level}] ${event.text}');
       _logFlushTimer ??= Timer(const Duration(milliseconds: 500), () {
         _logFlushTimer = null;
@@ -482,7 +499,7 @@ class _PlayerPageState extends State<PlayerPage>
         _pendingLogs.clear();
         setState(() {
           _logs.addAll(batch);
-          if (_logs.length > 24) _logs.removeRange(0, _logs.length - 24);
+          if (_logs.length > 14) _logs.removeRange(0, _logs.length - 14);
         });
       });
     }));
@@ -506,7 +523,7 @@ class _PlayerPageState extends State<PlayerPage>
         if (mounted) {
           setState(() {
             _logs.add('[hwdec] $event');
-            if (_logs.length > 24) _logs.removeRange(0, _logs.length - 24);
+            if (_logs.length > 14) _logs.removeRange(0, _logs.length - 14);
           });
         }
         unawaited(_handleHardwareErrorEvent(event));
@@ -524,7 +541,7 @@ class _PlayerPageState extends State<PlayerPage>
         // 记下报错时的位置，后面用"位置是否继续推进"判断这条是不是误报。
         _errorPosition = _position;
         _logs.add(line);
-        if (_logs.length > 24) _logs.removeRange(0, _logs.length - 24);
+        if (_logs.length > 14) _logs.removeRange(0, _logs.length - 14);
       });
     }));
     _subscriptions.add(_player.stream.position.listen((p) {
@@ -1421,13 +1438,90 @@ class _PlayerPageState extends State<PlayerPage>
 
   Future<void> _openCurrent(
       {VideoVariant? forceVariant, Duration? seekTo}) async {
-    if (_switching) return;
+    if (_switching) {
+      // 上一次 open 还没收尾。**不能**像老实现那样直接 return：
+      // 一旦后端卡住（libmdk 的 `textureSize` 在很多情况下永远不会完成，
+      // 见 fvp 源码注释），`_switching` 就永久为 true，之后每一次切换
+      // 都被静默吞掉——用户看到的就是画面停住、中央一直转「加载中…」、
+      // 上下键怎么按都没反应。这里记下最新一次请求，等收尾后立刻补开。
+      diag('player',
+          '切换被在途 open 挡住，记下待补开 idx=$_index aweme=${_current.id}');
+      _pendingOpen = () =>
+          _openCurrent(forceVariant: forceVariant, seekTo: seekTo);
+      _armSwitchWatchdog();
+      return;
+    }
     _switching = true;
+    _switchStartedAt = DateTime.now();
+    _armSwitchWatchdog();
     try {
       await _openCurrentInner(forceVariant: forceVariant, seekTo: seekTo);
     } finally {
       _switching = false;
+      _switchStartedAt = null;
+      _switchWatchdog?.cancel();
+      _switchWatchdog = null;
+      final pending = _pendingOpen;
+      _pendingOpen = null;
+      if (pending != null && mounted) {
+        diag('player', '前一次 open 已收尾，补开被挡下的切换');
+        unawaited(pending());
+      }
     }
+  }
+
+  /// 看门狗：在途 open 超过 [_switchHardTimeout] 仍没收尾 → 强制解锁。
+  ///
+  /// 这一层是最后的保险：shim 里已经给 prepare / 取纹理加了超时，
+  /// 正常情况根本走不到这里；但只要有一处原生调用挂住，没有它就会
+  /// 把整个播放页锁死，用户除了重启进程没有任何自救手段。
+  void _armSwitchWatchdog() {
+    _switchWatchdog?.cancel();
+    _switchWatchdog = Timer(_switchHardTimeout, () {
+      final started = _switchStartedAt;
+      if (!mounted || !_switching || started == null) return;
+      final waited = DateTime.now().difference(started).inMilliseconds;
+      diag('player', 'open 卡住 ${waited}ms 未收尾，强制解锁切换（后端挂起）');
+      _switching = false;
+      _switchStartedAt = null;
+      if (_opening) setState(() => _opening = false);
+      final pending = _pendingOpen;
+      _pendingOpen = null;
+      if (pending != null) {
+        unawaited(pending());
+      } else {
+        // 没有后续请求：至少让用户知道"卡住了、可以重试"。
+        setState(() => _playError = '这条视频加载超时（后端无响应）。\n'
+            '可以点“重试”，或用 ↑↓ 切换到其他作品。');
+      }
+    });
+  }
+
+  /// 15 秒硬超时：既没走时钟也没有明确错误时，给出可读原因 + 重试。
+  ///
+  /// 必须在 `await _player.open()` **之前**装好（见调用点注释），否则后端
+  /// 挂起时这段代码永远不会被执行。重试按钮直接调 `_openCurrent()`：
+  /// 会清空错误、重新选档、重新走完整 open → 首帧确认流程。
+  void _armOpenDeadline(int gen, String awemeId, String url) {
+    _loadDeadlineTimer?.cancel();
+    _loadDeadlineTimer = Timer(const Duration(seconds: 15), () {
+      if (!mounted || gen != _openGeneration) return;
+      if (_position.inMilliseconds > 0 || _playError != null) return;
+      diag('player', '加载超时（15s 未出画面）aweme=$awemeId url=$url');
+      // 15 秒还没出画面、网络地址又是好的：最可能就是解码/渲染卡住。
+      // 先自动降级（硬解 → 软解 → 软件渲染），别直接甩一个错误给用户。
+      if (_hardware || _renderHwAccel) {
+        diag('hwdec', '15 秒无画面，按硬解失败处理，开始自动降级');
+        unawaited(_fallbackToSoftware('加载超时（15 秒无画面）'));
+        return;
+      }
+      setState(() {
+        _opening = false;
+        _playError = '加载超时：15 秒内没有拿到可播放的画面。\n'
+            '可能原因：视频地址失效、网络受限或解码受阻。\n'
+            '可以点“重试”，或用 ↑↓ 切换下一条。';
+      });
+    });
   }
 
   Future<void> _openCurrentInner(
@@ -1531,6 +1625,12 @@ class _PlayerPageState extends State<PlayerPage>
         'variants=[${_variants.map((v) => "${v.label}/${v.height}p/${v.bitRate}").join(", ")}] '
         'hwdec=${_hardware ? PlatformAdapter.preferredHwdec : "no"} '
         'host=${Uri.tryParse(useUrl)?.host}');
+    // 超时兜底必须在 await 之前装上。
+    //
+    // 老实现把 15 秒硬超时写在 `finally` 里，而 `finally` 只有 try 语句块
+    // 正常结束/抛异常才会执行——如果 `_player.open()` 直接挂住（后端不返回），
+    // 这段代码永远跑不到，于是既没有错误提示、也没有任何自救手段。
+    _armOpenDeadline(gen, item.id, useUrl);
     try {
       // 首帧上屏前先静音：mpv 打开媒体后音频解码往往先于视频首帧，
       // 不静音就会"画面还是黑的但声音已经出来"。等首帧确认上屏再恢复音量。
@@ -1608,6 +1708,9 @@ class _PlayerPageState extends State<PlayerPage>
     } catch (e) {
       diag('player', 'open 异常: $e');
       if (mounted) {
+        // 失败必须收掉转圈：老实现只在"首帧放行"里清 _opening，
+        // 于是 open 抛错后遮罩会一直转，错误浮层叠在转圈上面。
+        if (_opening) setState(() => _opening = false);
         if (_isHardwareRelated('$e') && (_hardware || _renderHwAccel)) {
           diag('hwdec', 'open 阶段报硬解相关错误，尝试自动降级');
           unawaited(_fallbackToSoftware('open 异常：$e'));
@@ -1624,26 +1727,6 @@ class _PlayerPageState extends State<PlayerPage>
         if (!mounted || gen != _openGeneration) return;
         diag('avsync', '首帧等待兜底超时（2s），按顺序放行');
         _revealFirstFrame(gen);
-      });
-      // 硬超时：15 秒还没走时钟也没有明确的 mpv 错误时，给出可读原因 + 重试。
-      // 重试按钮直接调 _openCurrent()：会清空 _playError、重新选档、
-      // 重新走完整 open → 首帧确认流程，等于一次干净的重开。
-      _loadDeadlineTimer?.cancel();
-      _loadDeadlineTimer = Timer(const Duration(seconds: 15), () {
-        if (!mounted || gen != _openGeneration) return;
-        if (_position.inMilliseconds > 0 || _playError != null) return;
-        diag('player', '加载超时（15s 未出画面）aweme=${item.id} url=$useUrl');
-        // 15 秒还没出画面、网络地址又是好的：最可能就是解码/渲染卡住。
-        // 先自动降级（硬解 → 软解 → 软件渲染），别直接甩一个错误给用户。
-        if (_hardware || _renderHwAccel) {
-          diag('hwdec', '15 秒无画面，按硬解失败处理，开始自动降级');
-          unawaited(_fallbackToSoftware('加载超时（15 秒无画面）'));
-          return;
-        }
-        setState(() => _playError =
-            '加载超时：15 秒内没有拿到可播放的画面。\n'
-            '可能原因：视频地址失效、网络受限或解码受阻。\n'
-            '可以点“重试”，或用 ↑↓ 切换下一条。');
       });
     }
     await _readProperties();
@@ -1966,6 +2049,8 @@ class _PlayerPageState extends State<PlayerPage>
     if (_firstFrameShown) return;
     _firstFrameShown = true;
     _firstFrameTimer?.cancel();
+    // 画面已经放行：15 秒超时不再有意义（用户可能就停在 0 秒处暂停）。
+    _loadDeadlineTimer?.cancel();
     if (!mounted) {
       _unmuteAfterFirstFrame();
       return;
@@ -2867,6 +2952,8 @@ class _PlayerPageState extends State<PlayerPage>
     _propertyTimer?.cancel();
     _firstFrameTimer?.cancel();
     _loadDeadlineTimer?.cancel();
+    _switchWatchdog?.cancel();
+    _pendingOpen = null;
     _bufferTimer?.cancel();
     _logFlushTimer?.cancel();
     _uiTick.dispose();

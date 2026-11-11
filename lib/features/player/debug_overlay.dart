@@ -152,7 +152,7 @@ class DebugOverlay extends StatelessWidget {
             const Divider(height: 1),
             const SizedBox(height: 8),
             ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 150),
+              constraints: const BoxConstraints(maxHeight: 108),
               child: SingleChildScrollView(
                 reverse: true,
                 child: Column(
@@ -160,10 +160,10 @@ class DebugOverlay extends StatelessWidget {
                   children: [
                     for (final line in logs)
                       Padding(
-                        padding: const EdgeInsets.only(bottom: 3),
+                        padding: const EdgeInsets.only(bottom: 2),
                         child: Text(
                           line,
-                          maxLines: 2,
+                          maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             color: const Color(0xFF8E8E8E),
@@ -171,7 +171,7 @@ class DebugOverlay extends StatelessWidget {
                             fontFamily: PlatformAdapter.monospaceFontFamily,
                             fontFamilyFallback:
                                 PlatformAdapter.monospaceFallback,
-                            height: 1.35,
+                            height: 1.3,
                           ),
                         ),
                       ),
